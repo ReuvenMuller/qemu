@@ -47,6 +47,10 @@
 #include "tb-internal.h"
 #include "internal-common.h"
 
+#ifdef CONFIG_USER_ONLY
+bool llmopt_spike_try_dispatch(CPUState *cpu, vaddr pc);
+#endif
+
 /* -icount align implementation. */
 
 typedef struct SyncClocks {
@@ -960,6 +964,14 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
             if (check_for_breakpoints(cpu, s.pc, &s.cflags)) {
                 break;
             }
+
+#ifdef CONFIG_USER_ONLY
+            /* A pre-validated verdict may replace this exact function entry. */
+            if (unlikely(llmopt_spike_try_dispatch(cpu, s.pc))) {
+                last_tb = NULL;
+                continue;
+            }
+#endif
 
             tb = tb_lookup(cpu, s);
             if (tb == NULL) {
