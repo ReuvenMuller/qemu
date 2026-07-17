@@ -1038,7 +1038,9 @@ int main(int argc, char **argv, char **envp)
 #endif
 
     /* Load and freeze the next-run verdict map before any guest execution. */
-    llmopt_initialize(gdbstub != NULL, real_exec_path);
+    /* For dynamic executables info->load_bias is replaced by the ELF
+     * interpreter bias; code_offset retains the main executable bias. */
+    llmopt_initialize(gdbstub != NULL, real_exec_path, info->code_offset);
     cpu_loop(env);
     /* never exits */
     return 0;

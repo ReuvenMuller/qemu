@@ -20,7 +20,8 @@
 
 #ifndef TARGET_AARCH64
 
-void llmopt_initialize(bool debugger_active, const char *guest_binary)
+void llmopt_initialize(bool debugger_active, const char *guest_binary,
+                       uint64_t guest_load_bias)
 {
     if (g_strcmp0(getenv("QEMU_LLMOPT"), "1") == 0) {
         fprintf(stderr, "LLMOPT disabled: target adapter is not AArch64\n");
@@ -51,10 +52,14 @@ typedef struct LlmoptEntry {
     char catalog_id[32];
     char verdict_id[37];
     uint64_t pc;
+    uint64_t runtime_pc;
     size_t code_size;
     uint8_t code_sha256[32];
     size_t max_input;
     size_t state_bytes;
+    bool stable_direct;
+    bool blocks_x2;
+    bool pie_relative;
 } LlmoptEntry;
 
 typedef struct LlmoptRuntime {
@@ -88,6 +93,7 @@ typedef struct LlmoptRuntime {
     uint64_t baseline_region_ns;
     uint64_t substitution_region_count;
     uint64_t substitution_region_ns;
+    uint64_t stable_direct_hits;
 } LlmoptRuntime;
 
 static LlmoptRuntime runtime;
@@ -177,11 +183,14 @@ static bool parse_entry_line(const char *line, LlmoptEntry *entry)
     uint64_t pc, code_size, max_input, state_bytes;
     size_t expected_state;
 
-    if (g_strv_length(fields) != 8 ||
+    size_t field_count = g_strv_length(fields);
+
+    if ((field_count != 8 && field_count != 10) ||
         !algorithm_for_catalog(fields[0], &entry->algorithm, &expected_state) ||
         strlen(fields[0]) >= sizeof(entry->catalog_id) ||
         strlen(fields[1]) != 36 || strlen(fields[5]) == 0 ||
-        strcmp(fields[5], "portable_c") != 0 ||
+        (strcmp(fields[5], "portable_c") != 0 &&
+         strcmp(fields[5], "x86_64_optimized") != 0) ||
         !parse_u64(fields[2], 16, &pc) || !pc ||
         !parse_u64(fields[3], 10, &code_size) || !code_size ||
         code_size > LLMOPT_MAX_MAP_BYTES ||
@@ -192,6 +201,17 @@ static bool parse_entry_line(const char *line, LlmoptEntry *entry)
         max_input > SIZE_MAX) {
         return false;
     }
+    if (field_count == 10) {
+        if ((strcmp(fields[8], "absolute") != 0 &&
+             strcmp(fields[8], "pie_relative") != 0) ||
+            (strcmp(fields[9], "single") != 0 &&
+             strcmp(fields[9], "blocks_x2") != 0)) {
+            return false;
+        }
+        entry->pie_relative = strcmp(fields[8], "pie_relative") == 0;
+        entry->blocks_x2 = strcmp(fields[9], "blocks_x2") == 0;
+    }
+    entry->stable_direct = strcmp(fields[5], "x86_64_optimized") == 0;
     g_strlcpy(entry->catalog_id, fields[0], sizeof(entry->catalog_id));
     g_strlcpy(entry->verdict_id, fields[1], sizeof(entry->verdict_id));
     entry->pc = pc;
@@ -217,14 +237,16 @@ void llmopt_report(void)
             " baseline_region_count=%" PRIu64
             " baseline_region_ns=%" PRIu64
             " substitution_region_count=%" PRIu64
-            " substitution_region_ns=%" PRIu64 "\n",
+            " substitution_region_ns=%" PRIu64
+            " stable_direct_hits=%" PRIu64 "\n",
             runtime.entry_count, runtime.attempts, runtime.guard_checks,
             runtime.hits, runtime.guarded_fallbacks,
             runtime.rechecks_after_fallback, runtime.code_rejects,
             runtime.state_rejects, runtime.memory_rejects,
             runtime.forced_rejects, runtime.unguarded_executions,
             runtime.baseline_region_count, runtime.baseline_region_ns,
-            runtime.substitution_region_count, runtime.substitution_region_ns);
+            runtime.substitution_region_count, runtime.substitution_region_ns,
+            runtime.stable_direct_hits);
 }
 
 static void disable_map(const char *reason)
@@ -234,7 +256,8 @@ static void disable_map(const char *reason)
     fprintf(stderr, "LLMOPT disabled: %s\n", reason);
 }
 
-void llmopt_initialize(bool debugger_active, const char *guest_binary)
+void llmopt_initialize(bool debugger_active, const char *guest_binary,
+                       uint64_t guest_load_bias)
 {
     const char *path = getenv("QEMU_LLMOPT_MAP");
     g_autofree char *contents = NULL;
@@ -288,8 +311,17 @@ void llmopt_initialize(bool debugger_active, const char *guest_binary)
             disable_map("unsupported or malformed entry row");
             return;
         }
+        if (parsed[i].pie_relative) {
+            if (parsed[i].pc + guest_load_bias < parsed[i].pc) {
+                disable_map("PIE entry address overflow");
+                return;
+            }
+            parsed[i].runtime_pc = parsed[i].pc + guest_load_bias;
+        } else {
+            parsed[i].runtime_pc = parsed[i].pc;
+        }
         for (size_t j = 0; j < i; j++) {
-            if (parsed[i].pc == parsed[j].pc) {
+            if (parsed[i].runtime_pc == parsed[j].runtime_pc) {
                 disable_map("ambiguous duplicate entry PC");
                 return;
             }
@@ -559,7 +591,7 @@ static bool entry_bytes_match(const LlmoptEntry *entry)
     g_autofree uint8_t *code = g_try_malloc(entry->code_size);
     uint8_t digest[32];
 
-    if (!code || copy_from_user(code, entry->pc, entry->code_size) != 0) {
+    if (!code || copy_from_user(code, entry->runtime_pc, entry->code_size) != 0) {
         return false;
     }
     sha256_buffer(code, entry->code_size, digest);
@@ -623,17 +655,32 @@ static bool substitute_block(CPUARMState *env, const LlmoptEntry *entry)
     uint64_t state_address = env->xregs[0];
     uint64_t input_address = env->xregs[1];
     uint8_t input[64];
+    uint8_t *input_host = NULL;
     uint8_t *state_host;
     uint32_t state[8] = { 0 };
+    uint64_t blocks = entry->blocks_x2 ? env->xregs[2] : 1;
+    uint64_t input_bytes;
 
+    if (blocks == 0 || blocks > entry->max_input / sizeof(input)) {
+        return false;
+    }
+    input_bytes = blocks * sizeof(input);
     if ((state_address & 3) || state_address + entry->state_bytes < state_address ||
-        input_address + sizeof(input) < input_address ||
+        input_address + input_bytes < input_address ||
         ranges_overlap(state_address, entry->state_bytes,
-                       input_address, sizeof(input))) {
+                       input_address, input_bytes)) {
         return false;
     }
     state_host = lock_user(VERIFY_WRITE, state_address, entry->state_bytes, 1);
-    if (!state_host || copy_from_user(input, input_address, sizeof(input)) != 0) {
+    if (entry->stable_direct) {
+        input_host = lock_user(VERIFY_READ, input_address, input_bytes, 0);
+    }
+    if (!state_host || (entry->stable_direct && !input_host) ||
+        (!entry->stable_direct &&
+         copy_from_user(input, input_address, sizeof(input)) != 0)) {
+        if (input_host) {
+            unlock_user(input_host, input_address, 0);
+        }
         if (state_host) {
             unlock_user(state_host, state_address, 0);
         }
@@ -642,16 +689,37 @@ static bool substitute_block(CPUARMState *env, const LlmoptEntry *entry)
     for (size_t i = 0; i < entry->state_bytes / 4; i++) {
         state[i] = ldl_le_p(state_host + i * 4);
     }
-    if (entry->algorithm == LLMOPT_ALGO_MD5_BLOCK) {
-        host_md5_block(state, input);
-    } else if (entry->algorithm == LLMOPT_ALGO_SHA256_BLOCK) {
-        host_sha256_block(state, input);
-    } else {
-        unlock_user(state_host, state_address, 0);
-        return false;
+    for (uint64_t block = 0; block < blocks; block++) {
+        const uint8_t *current;
+        if (entry->stable_direct) {
+            current = input_host + block * sizeof(input);
+        } else if (block == 0) {
+            current = input;
+        } else {
+            if (copy_from_user(input, input_address + block * sizeof(input),
+                               sizeof(input)) != 0) {
+                unlock_user(state_host, state_address, 0);
+                return false;
+            }
+            current = input;
+        }
+        if (entry->algorithm == LLMOPT_ALGO_MD5_BLOCK) {
+            host_md5_block(state, current);
+        } else if (entry->algorithm == LLMOPT_ALGO_SHA256_BLOCK) {
+            host_sha256_block(state, current);
+        } else {
+            if (input_host) {
+                unlock_user(input_host, input_address, 0);
+            }
+            unlock_user(state_host, state_address, 0);
+            return false;
+        }
     }
     for (size_t i = 0; i < entry->state_bytes / 4; i++) {
         stl_le_p(state_host + i * 4, state[i]);
+    }
+    if (input_host) {
+        unlock_user(input_host, input_address, 0);
     }
     unlock_user(state_host, state_address, entry->state_bytes);
     env->pc = env->xregs[30];
@@ -690,7 +758,7 @@ LlmoptDispatchResult llmopt_try_dispatch(CPUState *cpu, vaddr pc)
         runtime.baseline_region_active = false;
     }
     for (size_t i = 0; i < runtime.entry_count; i++) {
-        if (runtime.entries[i].pc == pc) {
+        if (runtime.entries[i].runtime_pc == pc) {
             entry = &runtime.entries[i];
             break;
         }
@@ -751,6 +819,9 @@ LlmoptDispatchResult llmopt_try_dispatch(CPUState *cpu, vaddr pc)
         return guarded_fallback(pc, "internal_guard_audit");
     }
     runtime.hits++;
+    if (entry->stable_direct) {
+        runtime.stable_direct_hits++;
+    }
     if (runtime.trace) {
         fprintf(stderr,
                 "LLMOPT_HIT pc=0x%" PRIx64 " catalog=%s verdict=%s"
