@@ -29,6 +29,7 @@
 
 #include "qapi/error.h"
 #include "qemu.h"
+#include "exec/llmopt.h"
 #include "user-internals.h"
 #include "qemu/path.h"
 #include "qemu/queue.h"
@@ -1036,6 +1037,8 @@ int main(int argc, char **argv, char **envp)
     qemu_semihosting_guestfd_init();
 #endif
 
+    /* Load and freeze the next-run verdict map before any guest execution. */
+    llmopt_initialize(gdbstub != NULL, real_exec_path);
     cpu_loop(env);
     /* never exits */
     return 0;

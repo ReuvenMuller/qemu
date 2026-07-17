@@ -13,7 +13,7 @@ linux_user_ss.add(files(
   'fd-trans.c',
   'linuxload.c',
   'main.c',
-  'llmopt-spike.c',
+  'llmopt.c',
   'mmap.c',
   'signal.c',
   'strace.c',

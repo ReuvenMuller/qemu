@@ -46,10 +46,7 @@
 #include "tb-context.h"
 #include "tb-internal.h"
 #include "internal-common.h"
-
-#ifdef CONFIG_USER_ONLY
-bool llmopt_spike_try_dispatch(CPUState *cpu, vaddr pc);
-#endif
+#include "exec/llmopt.h"
 
 /* -icount align implementation. */
 
@@ -966,10 +963,16 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
             }
 
 #ifdef CONFIG_USER_ONLY
-            /* A pre-validated verdict may replace this exact function entry. */
-            if (unlikely(llmopt_spike_try_dispatch(cpu, s.pc))) {
+            /* Every candidate entry returns an explicit three-way result. */
+            LlmoptDispatchResult llmopt_result =
+                llmopt_try_dispatch(cpu, s.pc);
+            if (llmopt_result == LLMOPT_SUBSTITUTED) {
                 last_tb = NULL;
                 continue;
+            }
+            if (llmopt_result == LLMOPT_GUARDED_FALLBACK) {
+                /* Do not chain the predecessor around a future guard check. */
+                last_tb = NULL;
             }
 #endif
 
