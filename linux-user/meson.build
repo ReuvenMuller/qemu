@@ -14,6 +14,7 @@ linux_user_ss.add(files(
   'linuxload.c',
   'main.c',
   'llmopt.c',
+  'llmopt-variants.c',
   'mmap.c',
   'signal.c',
   'strace.c',
@@ -22,6 +23,12 @@ linux_user_ss.add(files(
   'uaccess.c',
   'uname.c',
 ))
+if host_arch == 'x86_64'
+  linux_user_ss.add(files(
+    'llmopt-md5-x86_64.S',
+    'llmopt-sha256-mb-x86_64.S',
+  ))
+endif
 linux_user_ss.add(rt)
 linux_user_ss.add(libdw)
 

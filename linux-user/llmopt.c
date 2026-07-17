@@ -14,6 +14,7 @@
 #include "qemu.h"
 #include "user-internals.h"
 #include "user/page-protection.h"
+#include "llmopt-variants.h"
 
 #define LLMOPT_MAX_ENTRIES 64
 #define LLMOPT_MAX_MAP_BYTES (1024 * 1024)
@@ -52,12 +53,16 @@ typedef enum LlmoptAlgorithm {
 
 typedef struct LlmoptEntry {
     LlmoptAlgorithm algorithm;
+    LlmoptHostVariant variant;
     char catalog_id[32];
     char verdict_id[37];
     uint64_t pc;
     uint64_t runtime_pc;
     size_t code_size;
     uint8_t code_sha256[32];
+    uint8_t implementation_sha256[32];
+    uint8_t generated_code_sha256[32];
+    uint8_t variant_admission_sha256[32];
     size_t max_input;
     size_t state_bytes;
     bool stable_direct;
@@ -105,6 +110,8 @@ typedef struct LlmoptRuntime {
     uint64_t substitution_region_count;
     uint64_t substitution_region_ns;
     uint64_t stable_direct_hits;
+    uint64_t portable_variant_hits;
+    uint64_t optimized_variant_hits;
     uint64_t code_verifications;
     uint64_t code_verification_failures;
     uint64_t page_version_checks;
@@ -205,7 +212,7 @@ static bool parse_entry_line(const char *line, LlmoptEntry *entry)
 
     size_t field_count = g_strv_length(fields);
 
-    if ((field_count != 8 && field_count != 10) ||
+    if (field_count != 14 ||
         !algorithm_for_catalog(fields[0], &entry->algorithm, &expected_state) ||
         strlen(fields[0]) >= sizeof(entry->catalog_id) ||
         strlen(fields[1]) != 36 || strlen(fields[5]) == 0 ||
@@ -215,23 +222,32 @@ static bool parse_entry_line(const char *line, LlmoptEntry *entry)
         !parse_u64(fields[3], 10, &code_size) || !code_size ||
         code_size > LLMOPT_MAX_MAP_BYTES ||
         !parse_sha256(fields[4], entry->code_sha256) ||
+        !parse_sha256(fields[10], entry->implementation_sha256) ||
+        !parse_sha256(fields[11], entry->generated_code_sha256) ||
+        !parse_sha256(fields[12], entry->variant_admission_sha256) ||
         !parse_u64(fields[6], 10, &max_input) || max_input > 67108864 ||
         !parse_u64(fields[7], 10, &state_bytes) ||
         state_bytes != expected_state || code_size > SIZE_MAX ||
         max_input > SIZE_MAX) {
         return false;
     }
-    if (field_count == 10) {
-        if ((strcmp(fields[8], "absolute") != 0 &&
-             strcmp(fields[8], "pie_relative") != 0) ||
-            (strcmp(fields[9], "single") != 0 &&
-             strcmp(fields[9], "blocks_x2") != 0)) {
-            return false;
-        }
-        entry->pie_relative = strcmp(fields[8], "pie_relative") == 0;
-        entry->blocks_x2 = strcmp(fields[9], "blocks_x2") == 0;
+    if ((strcmp(fields[8], "absolute") != 0 &&
+         strcmp(fields[8], "pie_relative") != 0) ||
+        (strcmp(fields[9], "single") != 0 &&
+         strcmp(fields[9], "blocks_x2") != 0) ||
+        (strcmp(fields[13], "stable_direct") != 0 &&
+         strcmp(fields[13], "transactional_copy") != 0)) {
+        return false;
     }
-    entry->stable_direct = strcmp(fields[5], "x86_64_optimized") == 0;
+    entry->pie_relative = strcmp(fields[8], "pie_relative") == 0;
+    entry->blocks_x2 = strcmp(fields[9], "blocks_x2") == 0;
+    entry->stable_direct = strcmp(fields[13], "stable_direct") == 0;
+    entry->variant = strcmp(fields[5], "portable_c") == 0 ?
+        LLMOPT_VARIANT_PORTABLE_C : LLMOPT_VARIANT_X86_64_OPTIMIZED;
+    if (!llmopt_variant_available(
+            entry->variant, entry->algorithm == LLMOPT_ALGO_SHA256_BLOCK)) {
+        return false;
+    }
     g_strlcpy(entry->catalog_id, fields[0], sizeof(entry->catalog_id));
     g_strlcpy(entry->verdict_id, fields[1], sizeof(entry->verdict_id));
     entry->pc = pc;
@@ -259,6 +275,8 @@ void llmopt_report(void)
             " substitution_region_count=%" PRIu64
             " substitution_region_ns=%" PRIu64
             " stable_direct_hits=%" PRIu64
+            " portable_variant_hits=%" PRIu64
+            " optimized_variant_hits=%" PRIu64
             " code_verifications=%" PRIu64
             " code_verification_failures=%" PRIu64
             " page_version_checks=%" PRIu64
@@ -275,7 +293,8 @@ void llmopt_report(void)
             runtime.forced_rejects, runtime.unguarded_executions,
             runtime.baseline_region_count, runtime.baseline_region_ns,
             runtime.substitution_region_count, runtime.substitution_region_ns,
-            runtime.stable_direct_hits, runtime.code_verifications,
+            runtime.stable_direct_hits, runtime.portable_variant_hits,
+            runtime.optimized_variant_hits, runtime.code_verifications,
             runtime.code_verification_failures, runtime.page_version_checks,
             runtime.page_version_mismatches, runtime.page_change_fallbacks,
             runtime.late_page_version_rejects, runtime.forced_code_changes,
@@ -326,7 +345,7 @@ void llmopt_initialize(bool debugger_active, const char *guest_binary,
         return;
     }
     lines = g_strsplit(contents, "\n", -1);
-    if (strcmp(lines[0], "llmopt_dispatch_map.v1") != 0 ||
+    if (strcmp(lines[0], "llmopt_dispatch_map.v2") != 0 ||
         !g_str_has_prefix(lines[1], "guest_sha256\t") ||
         !parse_sha256(lines[1] + strlen("guest_sha256\t"), guest_sha256) ||
         !guest_binary_matches(guest_binary,
@@ -376,11 +395,6 @@ void llmopt_initialize(bool debugger_active, const char *guest_binary,
 static inline uint64_t rotl64(uint64_t value, unsigned count)
 {
     return (value << count) | (value >> (64 - count));
-}
-
-static inline uint32_t rotl32(uint32_t value, unsigned count)
-{
-    return (value << count) | (value >> (32 - count));
 }
 
 static inline uint32_t rotr32(uint32_t value, unsigned count)
@@ -476,60 +490,6 @@ static uint32_t host_crc32(const uint8_t *data, size_t len, uint32_t initial)
         }
     }
     return crc ^ UINT32_MAX;
-}
-
-static const uint32_t md5_k[64] = {
-    0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee,
-    0xf57c0faf, 0x4787c62a, 0xa8304613, 0xfd469501,
-    0x698098d8, 0x8b44f7af, 0xffff5bb1, 0x895cd7be,
-    0x6b901122, 0xfd987193, 0xa679438e, 0x49b40821,
-    0xf61e2562, 0xc040b340, 0x265e5a51, 0xe9b6c7aa,
-    0xd62f105d, 0x02441453, 0xd8a1e681, 0xe7d3fbc8,
-    0x21e1cde6, 0xc33707d6, 0xf4d50d87, 0x455a14ed,
-    0xa9e3e905, 0xfcefa3f8, 0x676f02d9, 0x8d2a4c8a,
-    0xfffa3942, 0x8771f681, 0x6d9d6122, 0xfde5380c,
-    0xa4beea44, 0x4bdecfa9, 0xf6bb4b60, 0xbebfbc70,
-    0x289b7ec6, 0xeaa127fa, 0xd4ef3085, 0x04881d05,
-    0xd9d4d039, 0xe6db99e5, 0x1fa27cf8, 0xc4ac5665,
-    0xf4292244, 0x432aff97, 0xab9423a7, 0xfc93a039,
-    0x655b59c3, 0x8f0ccc92, 0xffeff47d, 0x85845dd1,
-    0x6fa87e4f, 0xfe2ce6e0, 0xa3014314, 0x4e0811a1,
-    0xf7537e82, 0xbd3af235, 0x2ad7d2bb, 0xeb86d391,
-};
-
-static const uint8_t md5_s[64] = {
-    7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22,
-    5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20, 5, 9, 14, 20,
-    4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
-    6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
-};
-
-static void host_md5_block(uint32_t state[4], const uint8_t block[64])
-{
-    uint32_t words[16];
-    uint32_t a = state[0], b = state[1], c = state[2], d = state[3];
-
-    for (size_t i = 0; i < 16; i++) {
-        words[i] = ldl_le_p(block + i * 4);
-    }
-    for (size_t i = 0; i < 64; i++) {
-        uint32_t f, g, saved_d;
-        if (i < 16) {
-            f = (b & c) | (~b & d); g = i;
-        } else if (i < 32) {
-            f = (d & b) | (~d & c); g = (5 * i + 1) % 16;
-        } else if (i < 48) {
-            f = b ^ c ^ d; g = (3 * i + 5) % 16;
-        } else {
-            f = c ^ (b | ~d); g = (7 * i) % 16;
-        }
-        saved_d = d;
-        d = c;
-        c = b;
-        b += rotl32(a + f + md5_k[i] + words[g], md5_s[i]);
-        a = saved_d;
-    }
-    state[0] += a; state[1] += b; state[2] += c; state[3] += d;
 }
 
 static const uint32_t sha256_k[64] = {
@@ -747,6 +707,7 @@ static bool substitute_block(CPUARMState *env, const LlmoptEntry *entry)
     uint32_t state[8] = { 0 };
     uint64_t blocks = entry->blocks_x2 ? env->xregs[2] : 1;
     uint64_t input_bytes;
+    bool variant_ok = true;
 
     if (blocks == 0 || blocks > entry->max_input / sizeof(input)) {
         return false;
@@ -776,31 +737,49 @@ static bool substitute_block(CPUARMState *env, const LlmoptEntry *entry)
     for (size_t i = 0; i < entry->state_bytes / 4; i++) {
         state[i] = ldl_le_p(state_host + i * 4);
     }
-    for (uint64_t block = 0; block < blocks; block++) {
-        const uint8_t *current;
-        if (entry->stable_direct) {
-            current = input_host + block * sizeof(input);
-        } else if (block == 0) {
-            current = input;
-        } else {
-            if (copy_from_user(input, input_address + block * sizeof(input),
-                               sizeof(input)) != 0) {
-                unlock_user(state_host, state_address, 0);
-                return false;
-            }
-            current = input;
-        }
+    if (entry->stable_direct) {
         if (entry->algorithm == LLMOPT_ALGO_MD5_BLOCK) {
-            host_md5_block(state, current);
+            variant_ok = llmopt_variant_md5(entry->variant, state,
+                                             input_host, blocks);
         } else if (entry->algorithm == LLMOPT_ALGO_SHA256_BLOCK) {
-            host_sha256_block(state, current);
+            variant_ok = llmopt_variant_sha256(entry->variant, state,
+                                                input_host, blocks);
         } else {
-            if (input_host) {
-                unlock_user(input_host, input_address, 0);
-            }
-            unlock_user(state_host, state_address, 0);
-            return false;
+            variant_ok = false;
         }
+    } else {
+        for (uint64_t block = 0; block < blocks; block++) {
+            const uint8_t *current;
+            if (block == 0) {
+                current = input;
+            } else {
+                if (copy_from_user(input, input_address + block * sizeof(input),
+                                   sizeof(input)) != 0) {
+                    unlock_user(state_host, state_address, 0);
+                    return false;
+                }
+                current = input;
+            }
+            if (entry->algorithm == LLMOPT_ALGO_MD5_BLOCK) {
+                variant_ok = llmopt_variant_md5(entry->variant, state,
+                                                 current, 1);
+            } else if (entry->algorithm == LLMOPT_ALGO_SHA256_BLOCK) {
+                variant_ok = llmopt_variant_sha256(entry->variant, state,
+                                                    current, 1);
+            } else {
+                variant_ok = false;
+            }
+            if (!variant_ok) {
+                break;
+            }
+        }
+    }
+    if (!variant_ok) {
+        if (input_host) {
+            unlock_user(input_host, input_address, 0);
+        }
+        unlock_user(state_host, state_address, 0);
+        return false;
     }
     for (size_t i = 0; i < entry->state_bytes / 4; i++) {
         stl_le_p(state_host + i * 4, state[i]);
@@ -963,14 +942,21 @@ LlmoptDispatchResult llmopt_try_dispatch(CPUState *cpu, vaddr pc)
         return guarded_fallback(pc, "internal_guard_audit");
     }
     runtime.hits++;
+    if (entry->variant == LLMOPT_VARIANT_PORTABLE_C) {
+        runtime.portable_variant_hits++;
+    } else {
+        runtime.optimized_variant_hits++;
+    }
     if (entry->stable_direct) {
         runtime.stable_direct_hits++;
     }
     if (runtime.trace) {
         fprintf(stderr,
                 "LLMOPT_HIT pc=0x%" PRIx64 " catalog=%s verdict=%s"
-                " guard_checked=1 hit=%" PRIu64 "\n",
+                " variant=%s guard_checked=1 hit=%" PRIu64 "\n",
                 (uint64_t)pc, entry->catalog_id, entry->verdict_id,
+                entry->variant == LLMOPT_VARIANT_PORTABLE_C ?
+                    "portable_c" : "x86_64_optimized",
                 runtime.hits);
     }
     return LLMOPT_SUBSTITUTED;
