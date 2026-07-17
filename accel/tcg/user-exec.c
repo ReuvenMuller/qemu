@@ -167,6 +167,22 @@ typedef struct PageFlagsNode {
 
 static IntervalTreeRoot pageflags_root;
 
+/*
+ * LLMOPT maps contain at most 64 entries of at most 1 MiB each.  Keep stable
+ * per-virtual-page slots for the process lifetime so a token cannot alias a
+ * remapped page.  Writes are rare; the common path only reads token versions.
+ */
+#define LLMOPT_MAX_TRACKED_CODE_PAGES 32768
+
+typedef struct LlmoptTrackedCodePage {
+    vaddr page;
+    uint64_t version;
+    bool used;
+} LlmoptTrackedCodePage;
+
+static LlmoptTrackedCodePage
+    llmopt_tracked_code_pages[LLMOPT_MAX_TRACKED_CODE_PAGES];
+
 static PageFlagsNode *pageflags_find(vaddr start, vaddr last)
 {
     IntervalTreeNode *n;
@@ -650,6 +666,128 @@ void tb_lock_page0(tb_page_addr_t address)
         mprotect(g2h_untagged_vaddr(start), last - start + 1,
                  prot & (PAGE_READ | PAGE_EXEC) ? PROT_READ : PROT_NONE);
     }
+}
+
+static int llmopt_find_tracked_page(vaddr page)
+{
+    for (size_t i = 0; i < LLMOPT_MAX_TRACKED_CODE_PAGES; i++) {
+        if (qatomic_read(&llmopt_tracked_code_pages[i].used) &&
+            llmopt_tracked_code_pages[i].page == page) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static int llmopt_get_tracked_page(vaddr page)
+{
+    int slot = llmopt_find_tracked_page(page);
+
+    assert_memory_lock();
+    if (slot >= 0) {
+        return slot;
+    }
+    for (size_t i = 0; i < LLMOPT_MAX_TRACKED_CODE_PAGES; i++) {
+        LlmoptTrackedCodePage *tracked = &llmopt_tracked_code_pages[i];
+
+        if (!qatomic_read(&tracked->used)) {
+            tracked->page = page;
+            qatomic_set(&tracked->version, 1);
+            qatomic_set(&tracked->used, true);
+            return i;
+        }
+    }
+    return -1;
+}
+
+void llmopt_page_version_invalidate_range(vaddr start, vaddr last)
+{
+    vaddr first_page, last_page;
+
+    assert_memory_lock();
+    if (last < start) {
+        return;
+    }
+    first_page = start & TARGET_PAGE_MASK;
+    last_page = last & TARGET_PAGE_MASK;
+    for (size_t i = 0; i < LLMOPT_MAX_TRACKED_CODE_PAGES; i++) {
+        LlmoptTrackedCodePage *tracked = &llmopt_tracked_code_pages[i];
+        vaddr page;
+
+        if (!qatomic_read(&tracked->used)) {
+            continue;
+        }
+        page = tracked->page;
+        if (page >= first_page && page <= last_page) {
+            qatomic_inc(&tracked->version);
+        }
+    }
+}
+
+bool llmopt_page_version_snapshot(vaddr start, size_t length, void *buffer,
+                                  LlmoptPageVersionToken *tokens,
+                                  size_t token_capacity,
+                                  size_t *token_count)
+{
+    vaddr last, first_page, last_page, page;
+    size_t required;
+    bool ok = false;
+
+    if (!length || !buffer || !tokens || !token_count ||
+        length - 1 > (vaddr)-1 - start) {
+        return false;
+    }
+    last = start + length - 1;
+    first_page = start & TARGET_PAGE_MASK;
+    last_page = last & TARGET_PAGE_MASK;
+    required = ((last_page - first_page) >> TARGET_PAGE_BITS) + 1;
+    if (required > token_capacity) {
+        return false;
+    }
+
+    mmap_lock();
+    if (!page_check_range(start, length, PAGE_READ)) {
+        goto out;
+    }
+    page = first_page;
+    for (size_t i = 0; i < required; i++) {
+        int slot = llmopt_get_tracked_page(page);
+
+        if (slot < 0) {
+            goto out;
+        }
+        /* QEMU will now fault and invalidate before any write can proceed. */
+        tb_lock_page0(page);
+        tokens[i].slot = slot;
+        tokens[i].version =
+            qatomic_read(&llmopt_tracked_code_pages[slot].version);
+        page += TARGET_PAGE_SIZE;
+    }
+    memcpy(buffer, g2h_untagged_vaddr(start), length);
+    *token_count = required;
+    ok = true;
+out:
+    mmap_unlock();
+    return ok;
+}
+
+bool llmopt_page_versions_match(const LlmoptPageVersionToken *tokens,
+                                size_t token_count)
+{
+    if (!tokens || !token_count) {
+        return false;
+    }
+    for (size_t i = 0; i < token_count; i++) {
+        uint32_t slot = tokens[i].slot;
+
+        if (slot >= LLMOPT_MAX_TRACKED_CODE_PAGES ||
+            !qatomic_read(&llmopt_tracked_code_pages[slot].used) ||
+            qatomic_read(&llmopt_tracked_code_pages[slot].version) !=
+                tokens[i].version) {
+            return false;
+        }
+    }
+    return true;
 }
 
 /*

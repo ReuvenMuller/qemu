@@ -973,6 +973,11 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
             if (llmopt_result == LLMOPT_GUARDED_FALLBACK) {
                 /* Do not chain the predecessor around a future guard check. */
                 last_tb = NULL;
+                /*
+                 * Make this baseline entry TB return through the dispatcher;
+                 * a later restored page must remain eligible for recheck.
+                 */
+                s.cflags |= CF_NO_GOTO_TB | CF_NO_GOTO_PTR;
             }
 #endif
 

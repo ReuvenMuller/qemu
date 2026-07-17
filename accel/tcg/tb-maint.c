@@ -1028,6 +1028,7 @@ void tb_invalidate_phys_range(CPUState *cpu, tb_page_addr_t start,
     PageForEachNext n;
 
     assert_memory_lock();
+    llmopt_page_version_invalidate_range(start, last);
 
     PAGE_FOR_EACH_TB(start, last, unused, tb, n) {
         tb_phys_invalidate__locked(tb);
@@ -1076,6 +1077,7 @@ bool tb_invalidate_phys_page_unwind(CPUState *cpu, tb_page_addr_t addr,
 
     last = addr | ~TARGET_PAGE_MASK;
     addr &= TARGET_PAGE_MASK;
+    llmopt_page_version_invalidate_range(addr, last);
     current_tb_modified = false;
 
     PAGE_FOR_EACH_TB(addr, last, unused, tb, n) {

@@ -3,8 +3,9 @@
  *
  * The offline installer validates verdict-cache and catalog authority and
  * emits a strict per-process map.  This file loads that map exactly once
- * before guest execution.  Every matching entry rechecks exact code bytes,
- * dynamic state, operands, and mapped memory before any replacement runs.
+ * before guest execution.  Exact code bytes are checked once per protected
+ * code-page version epoch; dynamic state, operands, and mapped memory remain
+ * per-call checks before any replacement runs.
  */
 #include "qemu/osdep.h"
 #include "qemu/atomic.h"
@@ -12,9 +13,11 @@
 #include "exec/llmopt.h"
 #include "qemu.h"
 #include "user-internals.h"
+#include "user/page-protection.h"
 
 #define LLMOPT_MAX_ENTRIES 64
 #define LLMOPT_MAX_MAP_BYTES (1024 * 1024)
+#define LLMOPT_MAX_CODE_PAGES 257
 #define LLMOPT_VALIDATION_QEMU_SHA256 \
     "623e64d16e1d01816ecc434070bf3a5486ee40273bc28d2d0b6a14c2bd77b931"
 
@@ -60,6 +63,9 @@ typedef struct LlmoptEntry {
     bool stable_direct;
     bool blocks_x2;
     bool pie_relative;
+    bool code_verified;
+    size_t page_token_count;
+    LlmoptPageVersionToken page_tokens[LLMOPT_MAX_CODE_PAGES];
 } LlmoptEntry;
 
 typedef struct LlmoptRuntime {
@@ -72,11 +78,16 @@ typedef struct LlmoptRuntime {
     bool baseline_only;
     bool force_guard_fail_once;
     bool forced_guard_fired;
+    bool force_code_change_once;
+    bool forced_code_change_fired;
+    bool forced_code_restore_pending;
     bool baseline_region_active;
     bool pending_recheck;
     uint64_t baseline_return_pc;
     uint64_t baseline_start_ns;
     uint64_t fallback_pc;
+    uint64_t forced_code_address;
+    uint8_t forced_code_original;
     size_t entry_count;
     LlmoptEntry entries[LLMOPT_MAX_ENTRIES];
     uint64_t attempts;
@@ -94,6 +105,15 @@ typedef struct LlmoptRuntime {
     uint64_t substitution_region_count;
     uint64_t substitution_region_ns;
     uint64_t stable_direct_hits;
+    uint64_t code_verifications;
+    uint64_t code_verification_failures;
+    uint64_t page_version_checks;
+    uint64_t page_version_mismatches;
+    uint64_t page_change_fallbacks;
+    uint64_t late_page_version_rejects;
+    uint64_t forced_code_changes;
+    uint64_t forced_code_restores;
+    uint64_t page_write_detection_failures;
 } LlmoptRuntime;
 
 static LlmoptRuntime runtime;
@@ -238,7 +258,16 @@ void llmopt_report(void)
             " baseline_region_ns=%" PRIu64
             " substitution_region_count=%" PRIu64
             " substitution_region_ns=%" PRIu64
-            " stable_direct_hits=%" PRIu64 "\n",
+            " stable_direct_hits=%" PRIu64
+            " code_verifications=%" PRIu64
+            " code_verification_failures=%" PRIu64
+            " page_version_checks=%" PRIu64
+            " page_version_mismatches=%" PRIu64
+            " page_change_fallbacks=%" PRIu64
+            " late_page_version_rejects=%" PRIu64
+            " forced_code_changes=%" PRIu64
+            " forced_code_restores=%" PRIu64
+            " page_write_detection_failures=%" PRIu64 "\n",
             runtime.entry_count, runtime.attempts, runtime.guard_checks,
             runtime.hits, runtime.guarded_fallbacks,
             runtime.rechecks_after_fallback, runtime.code_rejects,
@@ -246,7 +275,12 @@ void llmopt_report(void)
             runtime.forced_rejects, runtime.unguarded_executions,
             runtime.baseline_region_count, runtime.baseline_region_ns,
             runtime.substitution_region_count, runtime.substitution_region_ns,
-            runtime.stable_direct_hits);
+            runtime.stable_direct_hits, runtime.code_verifications,
+            runtime.code_verification_failures, runtime.page_version_checks,
+            runtime.page_version_mismatches, runtime.page_change_fallbacks,
+            runtime.late_page_version_rejects, runtime.forced_code_changes,
+            runtime.forced_code_restores,
+            runtime.page_write_detection_failures);
 }
 
 static void disable_map(const char *reason)
@@ -279,6 +313,8 @@ void llmopt_initialize(bool debugger_active, const char *guest_binary,
         g_strcmp0(getenv("QEMU_LLMOPT_BASELINE_ONLY"), "1") == 0;
     runtime.force_guard_fail_once =
         g_strcmp0(getenv("QEMU_LLMOPT_FORCE_GUARD_FAIL_ONCE"), "1") == 0;
+    runtime.force_code_change_once =
+        g_strcmp0(getenv("QEMU_LLMOPT_FORCE_CODE_CHANGE_ONCE"), "1") == 0;
     if (g_strcmp0(getenv("QEMU_LLMOPT"), "1") != 0) {
         return;
     }
@@ -586,16 +622,67 @@ static void sha256_buffer(const uint8_t *data, size_t length, uint8_t digest[32]
     }
 }
 
-static bool entry_bytes_match(const LlmoptEntry *entry)
+static bool entry_bytes_reverify(LlmoptEntry *entry)
 {
     g_autofree uint8_t *code = g_try_malloc(entry->code_size);
     uint8_t digest[32];
+    size_t token_count = 0;
+    bool matched;
 
-    if (!code || copy_from_user(code, entry->runtime_pc, entry->code_size) != 0) {
+    runtime.code_verifications++;
+    entry->code_verified = false;
+    if (!code ||
+        !llmopt_page_version_snapshot(entry->runtime_pc, entry->code_size,
+                                      code, entry->page_tokens,
+                                      LLMOPT_MAX_CODE_PAGES, &token_count)) {
+        entry->page_token_count = 0;
+        runtime.code_verification_failures++;
         return false;
     }
+    entry->page_token_count = token_count;
     sha256_buffer(code, entry->code_size, digest);
-    return memcmp(digest, entry->code_sha256, sizeof(digest)) == 0;
+    matched = memcmp(digest, entry->code_sha256, sizeof(digest)) == 0;
+    entry->code_verified = matched;
+    if (!matched) {
+        runtime.code_verification_failures++;
+    }
+    return matched;
+}
+
+static bool force_code_change(CPUState *cpu, LlmoptEntry *entry)
+{
+    uint8_t changed;
+
+    if (!runtime.force_code_change_once || runtime.forced_code_change_fired ||
+        runtime.attempts < 2) {
+        return false;
+    }
+    runtime.forced_code_change_fired = true;
+    runtime.forced_code_address = entry->runtime_pc + entry->code_size - 1;
+    if (cpu_memory_rw_debug(cpu, runtime.forced_code_address,
+                            &runtime.forced_code_original, 1, false) != 0) {
+        return false;
+    }
+    changed = runtime.forced_code_original ^ 1;
+    if (cpu_memory_rw_debug(cpu, runtime.forced_code_address,
+                            &changed, 1, true) != 0) {
+        return false;
+    }
+    runtime.forced_code_restore_pending = true;
+    runtime.forced_code_changes++;
+    return true;
+}
+
+static bool restore_forced_code_change(CPUState *cpu)
+{
+    if (runtime.forced_code_restore_pending &&
+        cpu_memory_rw_debug(cpu, runtime.forced_code_address,
+                            &runtime.forced_code_original, 1, true) == 0) {
+        runtime.forced_code_restore_pending = false;
+        runtime.forced_code_restores++;
+        return true;
+    }
+    return false;
 }
 
 static bool ranges_overlap(uint64_t left, size_t left_len,
@@ -742,10 +829,11 @@ static LlmoptDispatchResult guarded_fallback(vaddr pc, const char *reason)
 
 LlmoptDispatchResult llmopt_try_dispatch(CPUState *cpu, vaddr pc)
 {
-    const LlmoptEntry *entry = NULL;
+    LlmoptEntry *entry = NULL;
     CPUARMState *env;
     TaskState *task;
     bool guards_passed = false;
+    bool forced_code_change_now;
     bool substituted;
     uint64_t entry_start;
 
@@ -779,9 +867,56 @@ LlmoptDispatchResult llmopt_try_dispatch(CPUState *cpu, vaddr pc)
     }
     env = cpu_env(cpu);
     task = get_task_state(cpu);
-    if (!entry_bytes_match(entry)) {
+    forced_code_change_now = force_code_change(cpu, entry);
+    if (entry->page_token_count == 0) {
+        if (!entry_bytes_reverify(entry)) {
+            restore_forced_code_change(cpu);
+            runtime.code_rejects++;
+            return guarded_fallback(pc, "exact_entry_bytes_initial");
+        }
+    } else {
+        bool versions_match;
+
+        runtime.page_version_checks++;
+        versions_match = llmopt_page_versions_match(entry->page_tokens,
+                                                     entry->page_token_count);
+        if (forced_code_change_now && versions_match) {
+            /* A forced write that misses QEMU's invalidation hook is RED. */
+            runtime.page_write_detection_failures++;
+            entry->code_verified = false;
+            restore_forced_code_change(cpu);
+            return guarded_fallback(pc, "forced_code_change_undetected");
+        }
+        if (!versions_match) {
+            bool reverified;
+            bool restored_and_reverified = false;
+
+            runtime.page_version_mismatches++;
+            entry->code_verified = false;
+            reverified = entry_bytes_reverify(entry);
+            if (!reverified) {
+                runtime.code_rejects++;
+            }
+            if (restore_forced_code_change(cpu) && forced_code_change_now) {
+                /*
+                 * The changed bytes failed above.  Re-protect and verify the
+                 * restored bytes now, but still execute baseline for this
+                 * page-change call before re-enabling substitution.
+                 */
+                restored_and_reverified = entry_bytes_reverify(entry);
+            }
+            runtime.page_change_fallbacks++;
+            return guarded_fallback(
+                pc, restored_and_reverified ?
+                    "forced_code_changed_restored_reverified" :
+                    (reverified ? "code_page_changed_reverified" :
+                                  "code_page_changed_mismatch"));
+        }
+    }
+    restore_forced_code_change(cpu);
+    if (!entry->code_verified) {
         runtime.code_rejects++;
-        return guarded_fallback(pc, "exact_entry_bytes");
+        return guarded_fallback(pc, "exact_entry_bytes_unverified");
     }
     if (runtime.debugger_active || cpu->singlestep_enabled ||
         !QTAILQ_EMPTY(&cpu->watchpoints) ||
@@ -800,6 +935,15 @@ LlmoptDispatchResult llmopt_try_dispatch(CPUState *cpu, vaddr pc)
         runtime.baseline_return_pc = env->xregs[30];
         runtime.baseline_start_ns = entry_start;
         return guarded_fallback(pc, "baseline_measurement");
+    }
+    /* Close the check-to-use window before reading or committing guest state. */
+    runtime.page_version_checks++;
+    if (!entry->code_verified ||
+        !llmopt_page_versions_match(entry->page_tokens,
+                                    entry->page_token_count)) {
+        entry->code_verified = false;
+        runtime.late_page_version_rejects++;
+        return guarded_fallback(pc, "late_code_page_change");
     }
     guards_passed = true;
     if (entry->algorithm == LLMOPT_ALGO_MD5_BLOCK ||

@@ -15,6 +15,30 @@
 #include "exec/vaddr.h"
 #include "exec/translation-block.h"
 
+typedef struct LlmoptPageVersionToken {
+    uint32_t slot;
+    uint64_t version;
+} LlmoptPageVersionToken;
+
+/*
+ * Copy an exact guest-code range while holding mmap_lock, protect every
+ * covered page with QEMU's existing translated-code write protection, and
+ * return immutable slot/version tokens for those pages.  A later write or
+ * mapping invalidation advances the corresponding token before the bytes can
+ * be used as modified code.
+ */
+bool llmopt_page_version_snapshot(vaddr start, size_t length, void *buffer,
+                                  LlmoptPageVersionToken *tokens,
+                                  size_t token_capacity,
+                                  size_t *token_count);
+
+/* Lock-free hot-path validation of tokens returned by the snapshot helper. */
+bool llmopt_page_versions_match(const LlmoptPageVersionToken *tokens,
+                                size_t token_count);
+
+/* Called with mmap_lock held by QEMU's existing TB invalidation paths. */
+void llmopt_page_version_invalidate_range(vaddr start, vaddr last);
+
 int page_unprotect(CPUState *cpu, tb_page_addr_t address, uintptr_t pc);
 
 int page_get_flags(vaddr address);
