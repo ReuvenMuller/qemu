@@ -91,6 +91,9 @@ typedef struct LlmoptRuntime {
     bool force_code_change_once;
     bool forced_code_change_fired;
     bool forced_code_restore_pending;
+    bool guest_identity_verified;
+    char *guest_binary;
+    char expected_guest_sha256[65];
     bool baseline_region_active;
     bool sequence_region_active;
     bool pending_recheck;
@@ -131,6 +134,8 @@ typedef struct LlmoptRuntime {
     uint64_t forced_code_changes;
     uint64_t forced_code_restores;
     uint64_t page_write_detection_failures;
+    uint64_t guest_identity_checks;
+    uint64_t guest_identity_failures;
 } LlmoptRuntime;
 
 static LlmoptRuntime runtime;
@@ -316,7 +321,8 @@ static bool parse_entry_line(const char *line, LlmoptEntry *entry)
 
 void llmopt_report(void)
 {
-    if (!runtime.enabled || !runtime.report_enabled || runtime.reported) {
+    if ((!runtime.enabled && runtime.guest_identity_failures == 0) ||
+        !runtime.report_enabled || runtime.reported) {
         return;
     }
     runtime.reported = true;
@@ -344,7 +350,9 @@ void llmopt_report(void)
             " late_page_version_rejects=%" PRIu64
             " forced_code_changes=%" PRIu64
             " forced_code_restores=%" PRIu64
-            " page_write_detection_failures=%" PRIu64 "\n",
+            " page_write_detection_failures=%" PRIu64
+            " guest_identity_checks=%" PRIu64
+            " guest_identity_failures=%" PRIu64 "\n",
             runtime.entry_count, runtime.attempts, runtime.guard_checks,
             runtime.hits, runtime.guarded_fallbacks,
             runtime.rechecks_after_fallback, runtime.code_rejects,
@@ -359,7 +367,8 @@ void llmopt_report(void)
             runtime.page_version_mismatches, runtime.page_change_fallbacks,
             runtime.late_page_version_rejects, runtime.forced_code_changes,
             runtime.forced_code_restores,
-            runtime.page_write_detection_failures);
+            runtime.page_write_detection_failures,
+            runtime.guest_identity_checks, runtime.guest_identity_failures);
 }
 
 static void disable_map(const char *reason)
@@ -374,6 +383,7 @@ void llmopt_initialize(bool debugger_active, const char *guest_binary,
 {
     const char *path = getenv("QEMU_LLMOPT_MAP");
     g_autofree char *contents = NULL;
+    g_autofree char *guest_binary_copy = NULL;
     g_auto(GStrv) lines = NULL;
     gsize length = 0;
     uint64_t declared_count;
@@ -408,8 +418,6 @@ void llmopt_initialize(bool debugger_active, const char *guest_binary,
     if (strcmp(lines[0], "llmopt_dispatch_map.v2") != 0 ||
         !g_str_has_prefix(lines[1], "guest_sha256\t") ||
         !parse_sha256(lines[1] + strlen("guest_sha256\t"), guest_sha256) ||
-        !guest_binary_matches(guest_binary,
-                              lines[1] + strlen("guest_sha256\t")) ||
         !g_str_has_prefix(lines[2], "qemu_validation_sha256\t") ||
         strcmp(lines[2] + strlen("qemu_validation_sha256\t"),
                LLMOPT_VALIDATION_QEMU_SHA256) != 0 ||
@@ -442,7 +450,16 @@ void llmopt_initialize(bool debugger_active, const char *guest_binary,
             }
         }
     }
+    guest_binary_copy = g_strdup(guest_binary);
+    if (!guest_binary_copy) {
+        disable_map("guest binary path unavailable");
+        return;
+    }
     memcpy(runtime.entries, parsed, declared_count * sizeof(parsed[0]));
+    runtime.guest_binary = g_steal_pointer(&guest_binary_copy);
+    g_strlcpy(runtime.expected_guest_sha256,
+              lines[1] + strlen("guest_sha256\t"),
+              sizeof(runtime.expected_guest_sha256));
     runtime.entry_count = declared_count;
     runtime.enabled = true;
     atexit(llmopt_report);
@@ -579,6 +596,21 @@ static bool entry_bytes_reverify(LlmoptEntry *entry)
         runtime.code_verification_failures++;
     }
     return matched;
+}
+
+static bool guest_identity_verify_once(void)
+{
+    if (runtime.guest_identity_verified) {
+        return true;
+    }
+    runtime.guest_identity_checks++;
+    if (!guest_binary_matches(runtime.guest_binary,
+                              runtime.expected_guest_sha256)) {
+        runtime.guest_identity_failures++;
+        return false;
+    }
+    runtime.guest_identity_verified = true;
+    return true;
 }
 
 static bool force_code_change(CPUState *cpu, LlmoptEntry *entry)
@@ -978,9 +1010,16 @@ LlmoptDispatchResult llmopt_try_dispatch(CPUState *cpu, vaddr pc)
         runtime.sequence_region_count++;
         runtime.sequence_region_active = false;
     }
+    entry_start = now_ns();
     runtime.attempts++;
     runtime.guard_checks++;
-    entry_start = now_ns();
+    if (!guest_identity_verify_once()) {
+        LlmoptDispatchResult result =
+            guarded_fallback(pc, "guest_binary_identity");
+
+        disable_map("guest binary identity rejected at first dispatch");
+        return result;
+    }
     if (runtime.pending_recheck && runtime.fallback_pc == pc) {
         runtime.rechecks_after_fallback++;
         runtime.pending_recheck = false;
