@@ -132,6 +132,139 @@ static void sha256_portable(uint32_t state[8], const uint8_t block[64])
     state[4] += e; state[5] += f; state[6] += g; state[7] += h;
 }
 
+static inline uint64_t rotl64(uint64_t value, unsigned count)
+{
+    return (value << count) | (value >> (64 - count));
+}
+
+static inline uint64_t load_le64(const uint8_t *p)
+{
+    return (uint64_t)load_le32(p) | (uint64_t)load_le32(p + 4) << 32;
+}
+
+static inline uint64_t scalar_xxh64_round(uint64_t acc, uint64_t lane)
+{
+    return rotl64(acc + lane * UINT64_C(14029467366897019727), 31) *
+           UINT64_C(11400714785074694791);
+}
+
+static inline __attribute__((always_inline))
+uint64_t scalar_xxh64_body(const uint8_t *data, size_t length, uint64_t seed)
+{
+    const uint64_t p1 = UINT64_C(11400714785074694791);
+    const uint64_t p2 = UINT64_C(14029467366897019727);
+    const uint64_t p3 = UINT64_C(1609587929392839161);
+    const uint64_t p4 = UINT64_C(9650029242287828579);
+    const uint64_t p5 = UINT64_C(2870177450012600261);
+    const uint8_t *p = data, *end = data + length;
+    uint64_t hash;
+
+    if (length >= 32) {
+        uint64_t v1 = seed + p1 + p2, v2 = seed + p2;
+        uint64_t v3 = seed, v4 = seed - p1;
+        const uint8_t *limit = end - 32;
+        do {
+            v1 = scalar_xxh64_round(v1, load_le64(p)); p += 8;
+            v2 = scalar_xxh64_round(v2, load_le64(p)); p += 8;
+            v3 = scalar_xxh64_round(v3, load_le64(p)); p += 8;
+            v4 = scalar_xxh64_round(v4, load_le64(p)); p += 8;
+        } while (p <= limit);
+        hash = rotl64(v1, 1) + rotl64(v2, 7) +
+               rotl64(v3, 12) + rotl64(v4, 18);
+        v1 = scalar_xxh64_round(0, v1); hash = (hash ^ v1) * p1 + p4;
+        v2 = scalar_xxh64_round(0, v2); hash = (hash ^ v2) * p1 + p4;
+        v3 = scalar_xxh64_round(0, v3); hash = (hash ^ v3) * p1 + p4;
+        v4 = scalar_xxh64_round(0, v4); hash = (hash ^ v4) * p1 + p4;
+    } else {
+        hash = seed + p5;
+    }
+    hash += length;
+    while (p + 8 <= end) {
+        uint64_t lane = scalar_xxh64_round(0, load_le64(p));
+        hash = rotl64(hash ^ lane, 27) * p1 + p4; p += 8;
+    }
+    if (p + 4 <= end) {
+        hash = rotl64(hash ^ (uint64_t)load_le32(p) * p1, 23) * p2 + p3;
+        p += 4;
+    }
+    while (p < end) {
+        hash = rotl64(hash ^ (uint64_t)*p++ * p5, 11) * p1;
+    }
+    hash ^= hash >> 33; hash *= p2;
+    hash ^= hash >> 29; hash *= p3;
+    hash ^= hash >> 32;
+    return hash;
+}
+
+static inline __attribute__((always_inline))
+uint32_t scalar_crc32_body(const uint8_t *data, size_t length, uint32_t initial)
+{
+    uint32_t crc = initial ^ UINT32_C(0xffffffff);
+    for (size_t i = 0; i < length; i++) {
+        crc ^= data[i];
+        for (unsigned bit = 0; bit < 8; bit++) {
+            crc = (crc >> 1) ^ (UINT32_C(0xedb88320) & (0U - (crc & 1U)));
+        }
+    }
+    return crc ^ UINT32_C(0xffffffff);
+}
+
+static inline __attribute__((always_inline))
+uint32_t scalar_adler32_body(const uint8_t *data, size_t length,
+                             uint32_t initial)
+{
+    uint32_t s1 = initial & 0xffffU, s2 = initial >> 16;
+    for (size_t i = 0; i < length; i++) {
+        s1 += data[i];
+        if (s1 >= 65521U) {
+            s1 -= 65521U;
+        }
+        s2 += s1;
+        if (s2 >= 65521U) {
+            s2 -= 65521U;
+        }
+    }
+    return s2 << 16 | s1;
+}
+
+static __attribute__((noinline)) uint64_t
+xxh64_portable(const uint8_t *input, size_t length, uint64_t seed)
+{
+    return scalar_xxh64_body(input, length, seed);
+}
+
+static __attribute__((noinline)) uint32_t
+crc32_portable(const uint8_t *input, size_t length, uint32_t initial)
+{
+    return scalar_crc32_body(input, length, initial);
+}
+
+static __attribute__((noinline)) uint32_t
+adler32_portable(const uint8_t *input, size_t length, uint32_t initial)
+{
+    return scalar_adler32_body(input, length, initial);
+}
+
+#if defined(__x86_64__)
+static __attribute__((target("avx2"), noinline)) uint64_t
+xxh64_optimized(const uint8_t *input, size_t length, uint64_t seed)
+{
+    return scalar_xxh64_body(input, length, seed);
+}
+
+static __attribute__((target("avx2"), noinline)) uint32_t
+crc32_optimized(const uint8_t *input, size_t length, uint32_t initial)
+{
+    return scalar_crc32_body(input, length, initial);
+}
+
+static __attribute__((target("avx2"), noinline)) uint32_t
+adler32_optimized(const uint8_t *input, size_t length, uint32_t initial)
+{
+    return scalar_adler32_body(input, length, initial);
+}
+#endif
+
 #if defined(__x86_64__)
 extern void ossl_md5_block_asm_data_order(uint32_t state[4],
                                            const uint8_t *input,
@@ -175,15 +308,21 @@ static bool sha256_optimized(uint32_t state[8], const uint8_t *input,
 }
 #endif
 
-bool llmopt_variant_available(LlmoptHostVariant variant, bool sha256)
+bool llmopt_variant_available(LlmoptHostVariant variant,
+                              LlmoptVariantAlgorithm algorithm)
 {
     if (variant == LLMOPT_VARIANT_PORTABLE_C) {
         return true;
     }
 #if defined(__x86_64__)
     __builtin_cpu_init();
-    return sha256 ? __builtin_cpu_supports("ssse3") :
-                    __builtin_cpu_supports("sse2");
+    if (algorithm == LLMOPT_VARIANT_ALGO_SHA256) {
+        return __builtin_cpu_supports("ssse3");
+    }
+    if (algorithm == LLMOPT_VARIANT_ALGO_MD5) {
+        return __builtin_cpu_supports("sse2");
+    }
+    return __builtin_cpu_supports("avx2");
 #else
     return false;
 #endif
@@ -194,7 +333,7 @@ bool llmopt_variant_md5(unsigned variant, uint32_t state[4],
 {
     if (variant == LLMOPT_VARIANT_X86_64_OPTIMIZED) {
 #if defined(__x86_64__)
-        if (!llmopt_variant_available(variant, false)) {
+        if (!llmopt_variant_available(variant, LLMOPT_VARIANT_ALGO_MD5)) {
             return false;
         }
         ossl_md5_block_asm_data_order(state, input, blocks);
@@ -217,7 +356,7 @@ bool llmopt_variant_sha256(unsigned variant, uint32_t state[8],
 {
     if (variant == LLMOPT_VARIANT_X86_64_OPTIMIZED) {
 #if defined(__x86_64__)
-        if (!llmopt_variant_available(variant, true)) {
+        if (!llmopt_variant_available(variant, LLMOPT_VARIANT_ALGO_SHA256)) {
             return false;
         }
         return sha256_optimized(state, input, blocks);
@@ -232,4 +371,96 @@ bool llmopt_variant_sha256(unsigned variant, uint32_t state[8],
         sha256_portable(state, input + block * 64);
     }
     return true;
+}
+
+bool llmopt_variant_xxh64(unsigned variant, const uint8_t *input,
+                          size_t length, uint64_t seed, uint64_t *result)
+{
+    if (!result || !llmopt_variant_available(variant, LLMOPT_VARIANT_ALGO_XXH64)) {
+        return false;
+    }
+    if (variant == LLMOPT_VARIANT_PORTABLE_C) {
+        *result = xxh64_portable(input, length, seed);
+        return true;
+    }
+#if defined(__x86_64__)
+    if (variant == LLMOPT_VARIANT_X86_64_OPTIMIZED) {
+        *result = xxh64_optimized(input, length, seed);
+        return true;
+    }
+#endif
+    return false;
+}
+
+bool llmopt_variant_crc32(unsigned variant, const uint8_t *input,
+                          size_t length, uint32_t initial, uint32_t *result)
+{
+    if (!result || !llmopt_variant_available(variant, LLMOPT_VARIANT_ALGO_CRC32)) {
+        return false;
+    }
+    if (variant == LLMOPT_VARIANT_PORTABLE_C) {
+        *result = crc32_portable(input, length, initial);
+        return true;
+    }
+#if defined(__x86_64__)
+    if (variant == LLMOPT_VARIANT_X86_64_OPTIMIZED) {
+        *result = crc32_optimized(input, length, initial);
+        return true;
+    }
+#endif
+    return false;
+}
+
+bool llmopt_variant_adler32(unsigned variant, const uint8_t *input,
+                            size_t length, uint32_t initial, uint32_t *result)
+{
+    if (!result || !llmopt_variant_available(variant, LLMOPT_VARIANT_ALGO_ADLER32)) {
+        return false;
+    }
+    if (variant == LLMOPT_VARIANT_PORTABLE_C) {
+        *result = adler32_portable(input, length, initial);
+        return true;
+    }
+#if defined(__x86_64__)
+    if (variant == LLMOPT_VARIANT_X86_64_OPTIMIZED) {
+        *result = adler32_optimized(input, length, initial);
+        return true;
+    }
+#endif
+    return false;
+}
+
+__attribute__((noinline, optimize("no-tree-loop-distribute-patterns")))
+static void memcpy_portable(uint8_t *destination, const uint8_t *source,
+                            size_t length)
+{
+    while (length--) {
+        *destination++ = *source++;
+    }
+}
+
+__attribute__((target("avx2"), noinline))
+static void memcpy_optimized(uint8_t *destination, const uint8_t *source,
+                             size_t length)
+{
+    memcpy(destination, source, length);
+}
+
+bool llmopt_variant_memcpy(unsigned variant, uint8_t *destination,
+                           const uint8_t *source, size_t length)
+{
+    if (!llmopt_variant_available(variant, LLMOPT_VARIANT_ALGO_MEMCPY)) {
+        return false;
+    }
+    if (variant == LLMOPT_VARIANT_PORTABLE_C) {
+        memcpy_portable(destination, source, length);
+        return true;
+    }
+#if defined(__x86_64__)
+    if (variant == LLMOPT_VARIANT_X86_64_OPTIMIZED) {
+        memcpy_optimized(destination, source, length);
+        return true;
+    }
+#endif
+    return false;
 }

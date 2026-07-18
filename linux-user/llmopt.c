@@ -49,6 +49,7 @@ typedef enum LlmoptAlgorithm {
     LLMOPT_ALGO_MD5_BLOCK,
     LLMOPT_ALGO_CRC32,
     LLMOPT_ALGO_ADLER32,
+    LLMOPT_ALGO_MEMCPY,
 } LlmoptAlgorithm;
 
 typedef struct LlmoptEntry {
@@ -87,9 +88,12 @@ typedef struct LlmoptRuntime {
     bool forced_code_change_fired;
     bool forced_code_restore_pending;
     bool baseline_region_active;
+    bool sequence_region_active;
     bool pending_recheck;
     uint64_t baseline_return_pc;
     uint64_t baseline_start_ns;
+    uint64_t sequence_return_pc;
+    uint64_t sequence_start_ns;
     uint64_t fallback_pc;
     uint64_t forced_code_address;
     uint8_t forced_code_original;
@@ -109,6 +113,8 @@ typedef struct LlmoptRuntime {
     uint64_t baseline_region_ns;
     uint64_t substitution_region_count;
     uint64_t substitution_region_ns;
+    uint64_t sequence_region_count;
+    uint64_t sequence_region_ns;
     uint64_t stable_direct_hits;
     uint64_t portable_variant_hits;
     uint64_t optimized_variant_hits;
@@ -124,6 +130,8 @@ typedef struct LlmoptRuntime {
 } LlmoptRuntime;
 
 static LlmoptRuntime runtime;
+
+static uint64_t now_ns(void);
 
 static bool parse_u64(const char *text, int base, uint64_t *value)
 {
@@ -198,10 +206,33 @@ static bool algorithm_for_catalog(const char *catalog, LlmoptAlgorithm *algo,
     } else if (strcmp(catalog, "checksum.adler32") == 0) {
         *algo = LLMOPT_ALGO_ADLER32;
         *expected_state = 0;
+    } else if (strcmp(catalog, "memory.memcpy") == 0) {
+        *algo = LLMOPT_ALGO_MEMCPY;
+        *expected_state = 0;
     } else {
         return false;
     }
     return true;
+}
+
+static LlmoptVariantAlgorithm variant_algorithm(LlmoptAlgorithm algorithm)
+{
+    switch (algorithm) {
+    case LLMOPT_ALGO_XXH64:
+        return LLMOPT_VARIANT_ALGO_XXH64;
+    case LLMOPT_ALGO_SHA256_BLOCK:
+        return LLMOPT_VARIANT_ALGO_SHA256;
+    case LLMOPT_ALGO_MD5_BLOCK:
+        return LLMOPT_VARIANT_ALGO_MD5;
+    case LLMOPT_ALGO_CRC32:
+        return LLMOPT_VARIANT_ALGO_CRC32;
+    case LLMOPT_ALGO_ADLER32:
+        return LLMOPT_VARIANT_ALGO_ADLER32;
+    case LLMOPT_ALGO_MEMCPY:
+        return LLMOPT_VARIANT_ALGO_MEMCPY;
+    default:
+        g_assert_not_reached();
+    }
 }
 
 static bool parse_entry_line(const char *line, LlmoptEntry *entry)
@@ -244,8 +275,8 @@ static bool parse_entry_line(const char *line, LlmoptEntry *entry)
     entry->stable_direct = strcmp(fields[13], "stable_direct") == 0;
     entry->variant = strcmp(fields[5], "portable_c") == 0 ?
         LLMOPT_VARIANT_PORTABLE_C : LLMOPT_VARIANT_X86_64_OPTIMIZED;
-    if (!llmopt_variant_available(
-            entry->variant, entry->algorithm == LLMOPT_ALGO_SHA256_BLOCK)) {
+    if (!llmopt_variant_available(entry->variant,
+                                  variant_algorithm(entry->algorithm))) {
         return false;
     }
     g_strlcpy(entry->catalog_id, fields[0], sizeof(entry->catalog_id));
@@ -274,6 +305,8 @@ void llmopt_report(void)
             " baseline_region_ns=%" PRIu64
             " substitution_region_count=%" PRIu64
             " substitution_region_ns=%" PRIu64
+            " sequence_region_count=%" PRIu64
+            " sequence_region_ns=%" PRIu64
             " stable_direct_hits=%" PRIu64
             " portable_variant_hits=%" PRIu64
             " optimized_variant_hits=%" PRIu64
@@ -293,6 +326,7 @@ void llmopt_report(void)
             runtime.forced_rejects, runtime.unguarded_executions,
             runtime.baseline_region_count, runtime.baseline_region_ns,
             runtime.substitution_region_count, runtime.substitution_region_ns,
+            runtime.sequence_region_count, runtime.sequence_region_ns,
             runtime.stable_direct_hits, runtime.portable_variant_hits,
             runtime.optimized_variant_hits, runtime.code_verifications,
             runtime.code_verification_failures, runtime.page_version_checks,
@@ -392,11 +426,6 @@ void llmopt_initialize(bool debugger_active, const char *guest_binary,
     }
 }
 
-static inline uint64_t rotl64(uint64_t value, unsigned count)
-{
-    return (value << count) | (value >> (64 - count));
-}
-
 static inline uint32_t rotr32(uint32_t value, unsigned count)
 {
     return (value >> count) | (value << (32 - count));
@@ -407,89 +436,6 @@ static uint64_t now_ns(void)
     struct timespec value;
     clock_gettime(CLOCK_MONOTONIC, &value);
     return (uint64_t)value.tv_sec * UINT64_C(1000000000) + value.tv_nsec;
-}
-
-#define XXH_P1 UINT64_C(11400714785074694791)
-#define XXH_P2 UINT64_C(14029467366897019727)
-#define XXH_P3 UINT64_C(1609587929392839161)
-#define XXH_P4 UINT64_C(9650029242287828579)
-#define XXH_P5 UINT64_C(2870177450012600261)
-
-static uint64_t xxh_round(uint64_t acc, uint64_t input)
-{
-    acc += input * XXH_P2;
-    return rotl64(acc, 31) * XXH_P1;
-}
-
-static uint64_t host_xxh64(const uint8_t *p, size_t len, uint64_t seed)
-{
-    const uint8_t *end = p + len;
-    uint64_t hash;
-
-    if (len >= 32) {
-        const uint8_t *limit = end - 32;
-        uint64_t v1 = seed + XXH_P1 + XXH_P2;
-        uint64_t v2 = seed + XXH_P2;
-        uint64_t v3 = seed;
-        uint64_t v4 = seed - XXH_P1;
-        do {
-            v1 = xxh_round(v1, ldq_le_p(p)); p += 8;
-            v2 = xxh_round(v2, ldq_le_p(p)); p += 8;
-            v3 = xxh_round(v3, ldq_le_p(p)); p += 8;
-            v4 = xxh_round(v4, ldq_le_p(p)); p += 8;
-        } while (p <= limit);
-        hash = rotl64(v1, 1) + rotl64(v2, 7) +
-               rotl64(v3, 12) + rotl64(v4, 18);
-        v1 = xxh_round(0, v1); hash = (hash ^ v1) * XXH_P1 + XXH_P4;
-        v2 = xxh_round(0, v2); hash = (hash ^ v2) * XXH_P1 + XXH_P4;
-        v3 = xxh_round(0, v3); hash = (hash ^ v3) * XXH_P1 + XXH_P4;
-        v4 = xxh_round(0, v4); hash = (hash ^ v4) * XXH_P1 + XXH_P4;
-    } else {
-        hash = seed + XXH_P5;
-    }
-    hash += len;
-    while (p + 8 <= end) {
-        uint64_t lane = xxh_round(0, ldq_le_p(p));
-        hash = rotl64(hash ^ lane, 27) * XXH_P1 + XXH_P4;
-        p += 8;
-    }
-    if (p + 4 <= end) {
-        hash = rotl64(hash ^ (uint64_t)(uint32_t)ldl_le_p(p) * XXH_P1, 23) *
-               XXH_P2 + XXH_P3;
-        p += 4;
-    }
-    while (p < end) {
-        hash = rotl64(hash ^ (uint64_t)*p++ * XXH_P5, 11) * XXH_P1;
-    }
-    hash ^= hash >> 33;
-    hash *= XXH_P2;
-    hash ^= hash >> 29;
-    hash *= XXH_P3;
-    hash ^= hash >> 32;
-    return hash;
-}
-
-static uint32_t host_adler32(const uint8_t *data, size_t len, uint32_t initial)
-{
-    uint32_t s1 = initial & 0xffff;
-    uint32_t s2 = initial >> 16;
-    for (size_t i = 0; i < len; i++) {
-        s1 = (s1 + data[i]) % 65521;
-        s2 = (s2 + s1) % 65521;
-    }
-    return (s2 << 16) | s1;
-}
-
-static uint32_t host_crc32(const uint8_t *data, size_t len, uint32_t initial)
-{
-    uint32_t crc = initial ^ UINT32_MAX;
-    for (size_t i = 0; i < len; i++) {
-        crc ^= data[i];
-        for (unsigned bit = 0; bit < 8; bit++) {
-            crc = (crc >> 1) ^ (UINT32_C(0xedb88320) & -(crc & 1));
-        }
-    }
-    return crc ^ UINT32_MAX;
 }
 
 static const uint32_t sha256_k[64] = {
@@ -673,28 +619,61 @@ static bool substitute_scalar(CPUARMState *env, const LlmoptEntry *entry)
     uint64_t address = env->xregs[0];
     uint64_t length = env->xregs[1];
     uint64_t initial = env->xregs[2];
-    g_autofree uint8_t *input = copy_input(address, length, entry->max_input);
+    g_autofree uint8_t *copied_input = NULL;
+    uint8_t empty_input = 0;
+    uint8_t *input = NULL;
     uint64_t result;
+    uint32_t result32;
 
+    if (length > entry->max_input || length > SIZE_MAX ||
+        address + length < address) {
+        return false;
+    }
+    if (entry->stable_direct) {
+        input = length ? lock_user(VERIFY_READ, address, length, 0) : &empty_input;
+    } else {
+        copied_input = copy_input(address, length, entry->max_input);
+        input = copied_input;
+    }
     if (!input) {
         return false;
     }
     switch (entry->algorithm) {
     case LLMOPT_ALGO_XXH64:
-        result = host_xxh64(input, length, initial);
+        if (!llmopt_variant_xxh64(entry->variant, input, length, initial,
+                                  &result)) {
+            goto fail;
+        }
         break;
     case LLMOPT_ALGO_CRC32:
-        result = host_crc32(input, length, initial);
+        if (!llmopt_variant_crc32(entry->variant, input, length,
+                                  (uint32_t)initial, &result32)) {
+            goto fail;
+        }
+        result = result32;
         break;
     case LLMOPT_ALGO_ADLER32:
-        result = host_adler32(input, length, initial);
+        if (!llmopt_variant_adler32(entry->variant, input, length,
+                                    (uint32_t)initial, &result32)) {
+            goto fail;
+        }
+        result = result32;
         break;
     default:
-        return false;
+        goto fail;
+    }
+    if (entry->stable_direct && length) {
+        unlock_user(input, address, 0);
     }
     env->xregs[0] = result;
     env->pc = env->xregs[30];
     return true;
+
+fail:
+    if (entry->stable_direct && length) {
+        unlock_user(input, address, 0);
+    }
+    return false;
 }
 
 static bool substitute_block(CPUARMState *env, const LlmoptEntry *entry)
@@ -792,6 +771,51 @@ static bool substitute_block(CPUARMState *env, const LlmoptEntry *entry)
     return true;
 }
 
+static bool substitute_memcpy(CPUARMState *env, const LlmoptEntry *entry)
+{
+    uint64_t destination_address = env->xregs[0];
+    uint64_t source_address = env->xregs[1];
+    uint64_t length = env->xregs[2];
+    g_autofree uint8_t *copied_input = NULL;
+    uint8_t *source = NULL;
+    uint8_t *destination = NULL;
+
+    if (length > entry->max_input || length > SIZE_MAX ||
+        destination_address + length < destination_address ||
+        source_address + length < source_address ||
+        ranges_overlap(destination_address, length, source_address, length)) {
+        return false;
+    }
+    if (length == 0) {
+        env->pc = env->xregs[30];
+        return true;
+    }
+    destination = lock_user(VERIFY_WRITE, destination_address, length, 1);
+    if (entry->stable_direct) {
+        source = lock_user(VERIFY_READ, source_address, length, 0);
+    } else {
+        copied_input = copy_input(source_address, length, entry->max_input);
+        source = copied_input;
+    }
+    if (!destination || !source ||
+        !llmopt_variant_memcpy(entry->variant, destination, source, length)) {
+        if (entry->stable_direct && source) {
+            unlock_user(source, source_address, 0);
+        }
+        if (destination) {
+            unlock_user(destination, destination_address, 0);
+        }
+        return false;
+    }
+    if (entry->stable_direct) {
+        unlock_user(source, source_address, 0);
+    }
+    unlock_user(destination, destination_address, length);
+    env->xregs[0] = destination_address;
+    env->pc = env->xregs[30];
+    return true;
+}
+
 static LlmoptDispatchResult guarded_fallback(vaddr pc, const char *reason)
 {
     runtime.guarded_fallbacks++;
@@ -824,6 +848,11 @@ LlmoptDispatchResult llmopt_try_dispatch(CPUState *cpu, vaddr pc)
         runtime.baseline_region_count++;
         runtime.baseline_region_active = false;
     }
+    if (runtime.sequence_region_active && pc == runtime.sequence_return_pc) {
+        runtime.sequence_region_ns += now_ns() - runtime.sequence_start_ns;
+        runtime.sequence_region_count++;
+        runtime.sequence_region_active = false;
+    }
     for (size_t i = 0; i < runtime.entry_count; i++) {
         if (runtime.entries[i].runtime_pc == pc) {
             entry = &runtime.entries[i];
@@ -832,6 +861,17 @@ LlmoptDispatchResult llmopt_try_dispatch(CPUState *cpu, vaddr pc)
     }
     if (!entry) {
         return LLMOPT_NOT_APPLICABLE;
+    }
+    /* A repeated block entry proves that the preceding call returned. */
+    if (runtime.baseline_region_active) {
+        runtime.baseline_region_ns += now_ns() - runtime.baseline_start_ns;
+        runtime.baseline_region_count++;
+        runtime.baseline_region_active = false;
+    }
+    if (runtime.sequence_region_active) {
+        runtime.sequence_region_ns += now_ns() - runtime.sequence_start_ns;
+        runtime.sequence_region_count++;
+        runtime.sequence_region_active = false;
     }
     runtime.attempts++;
     runtime.guard_checks++;
@@ -928,6 +968,8 @@ LlmoptDispatchResult llmopt_try_dispatch(CPUState *cpu, vaddr pc)
     if (entry->algorithm == LLMOPT_ALGO_MD5_BLOCK ||
         entry->algorithm == LLMOPT_ALGO_SHA256_BLOCK) {
         substituted = substitute_block(env, entry);
+    } else if (entry->algorithm == LLMOPT_ALGO_MEMCPY) {
+        substituted = substitute_memcpy(env, entry);
     } else {
         substituted = substitute_scalar(env, entry);
     }
@@ -937,6 +979,11 @@ LlmoptDispatchResult llmopt_try_dispatch(CPUState *cpu, vaddr pc)
     }
     runtime.substitution_region_ns += now_ns() - entry_start;
     runtime.substitution_region_count++;
+    if (runtime.report_enabled) {
+        runtime.sequence_region_active = true;
+        runtime.sequence_return_pc = env->xregs[30];
+        runtime.sequence_start_ns = entry_start;
+    }
     if (!guards_passed) {
         runtime.unguarded_executions++;
         return guarded_fallback(pc, "internal_guard_audit");

@@ -10,10 +10,28 @@ typedef enum LlmoptHostVariant {
     LLMOPT_VARIANT_X86_64_OPTIMIZED = 1,
 } LlmoptHostVariant;
 
-bool llmopt_variant_available(LlmoptHostVariant variant, bool sha256);
+typedef enum LlmoptVariantAlgorithm {
+    LLMOPT_VARIANT_ALGO_XXH64,
+    LLMOPT_VARIANT_ALGO_SHA256,
+    LLMOPT_VARIANT_ALGO_MD5,
+    LLMOPT_VARIANT_ALGO_CRC32,
+    LLMOPT_VARIANT_ALGO_ADLER32,
+    LLMOPT_VARIANT_ALGO_MEMCPY,
+} LlmoptVariantAlgorithm;
+
+bool llmopt_variant_available(LlmoptHostVariant variant,
+                              LlmoptVariantAlgorithm algorithm);
 bool llmopt_variant_md5(unsigned variant, uint32_t state[4],
                         const uint8_t *input, size_t blocks);
 bool llmopt_variant_sha256(unsigned variant, uint32_t state[8],
                            const uint8_t *input, size_t blocks);
+bool llmopt_variant_xxh64(unsigned variant, const uint8_t *input,
+                          size_t length, uint64_t seed, uint64_t *result);
+bool llmopt_variant_crc32(unsigned variant, const uint8_t *input,
+                          size_t length, uint32_t initial, uint32_t *result);
+bool llmopt_variant_adler32(unsigned variant, const uint8_t *input,
+                            size_t length, uint32_t initial, uint32_t *result);
+bool llmopt_variant_memcpy(unsigned variant, uint8_t *destination,
+                           const uint8_t *source, size_t length);
 
 #endif
