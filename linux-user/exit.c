@@ -33,6 +33,7 @@ void preexit_cleanup(CPUArchState *env, int code)
 #ifdef CONFIG_GCOV
         __gcov_dump();
 #endif
+        llmopt_cleanup();
         llmopt_report();
         gdb_exit(code);
         qemu_plugin_user_exit();

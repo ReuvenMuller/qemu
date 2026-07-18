@@ -12,6 +12,7 @@ typedef enum LlmoptDispatchResult {
 
 void llmopt_initialize(bool debugger_active, const char *guest_binary,
                        uint64_t guest_load_bias);
+void llmopt_cleanup(void);
 void llmopt_report(void);
 LlmoptDispatchResult llmopt_try_dispatch(CPUState *cpu, vaddr pc);
 
