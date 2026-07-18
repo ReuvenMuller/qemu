@@ -50,6 +50,8 @@ typedef enum LlmoptAlgorithm {
     LLMOPT_ALGO_CRC32,
     LLMOPT_ALGO_ADLER32,
     LLMOPT_ALGO_MEMCPY,
+    LLMOPT_ALGO_LZ_MATCH_COPY,
+    LLMOPT_ALGO_MEMSET,
 } LlmoptAlgorithm;
 
 typedef struct LlmoptEntry {
@@ -68,6 +70,8 @@ typedef struct LlmoptEntry {
     size_t state_bytes;
     bool stable_direct;
     bool blocks_x2;
+    bool lz_overlap;
+    bool memset_shape;
     bool pie_relative;
     bool code_verified;
     size_t page_token_count;
@@ -209,6 +213,12 @@ static bool algorithm_for_catalog(const char *catalog, LlmoptAlgorithm *algo,
     } else if (strcmp(catalog, "memory.memcpy") == 0) {
         *algo = LLMOPT_ALGO_MEMCPY;
         *expected_state = 0;
+    } else if (strcmp(catalog, "codec.lz.match_copy") == 0) {
+        *algo = LLMOPT_ALGO_LZ_MATCH_COPY;
+        *expected_state = 0;
+    } else if (strcmp(catalog, "memory.memset") == 0) {
+        *algo = LLMOPT_ALGO_MEMSET;
+        *expected_state = 0;
     } else {
         return false;
     }
@@ -230,6 +240,10 @@ static LlmoptVariantAlgorithm variant_algorithm(LlmoptAlgorithm algorithm)
         return LLMOPT_VARIANT_ALGO_ADLER32;
     case LLMOPT_ALGO_MEMCPY:
         return LLMOPT_VARIANT_ALGO_MEMCPY;
+    case LLMOPT_ALGO_LZ_MATCH_COPY:
+        return LLMOPT_VARIANT_ALGO_LZ_MATCH_COPY;
+    case LLMOPT_ALGO_MEMSET:
+        return LLMOPT_VARIANT_ALGO_MEMSET;
     default:
         g_assert_not_reached();
     }
@@ -265,14 +279,26 @@ static bool parse_entry_line(const char *line, LlmoptEntry *entry)
     if ((strcmp(fields[8], "absolute") != 0 &&
          strcmp(fields[8], "pie_relative") != 0) ||
         (strcmp(fields[9], "single") != 0 &&
-         strcmp(fields[9], "blocks_x2") != 0) ||
+         strcmp(fields[9], "blocks_x2") != 0 &&
+         strcmp(fields[9], "lz_overlap") != 0 &&
+         strcmp(fields[9], "memset") != 0) ||
         (strcmp(fields[13], "stable_direct") != 0 &&
          strcmp(fields[13], "transactional_copy") != 0)) {
         return false;
     }
     entry->pie_relative = strcmp(fields[8], "pie_relative") == 0;
     entry->blocks_x2 = strcmp(fields[9], "blocks_x2") == 0;
+    entry->lz_overlap = strcmp(fields[9], "lz_overlap") == 0;
+    entry->memset_shape = strcmp(fields[9], "memset") == 0;
     entry->stable_direct = strcmp(fields[13], "stable_direct") == 0;
+    if (entry->lz_overlap != (entry->algorithm == LLMOPT_ALGO_LZ_MATCH_COPY) ||
+        (entry->lz_overlap && entry->stable_direct)) {
+        return false;
+    }
+    if (entry->memset_shape != (entry->algorithm == LLMOPT_ALGO_MEMSET) ||
+        (entry->memset_shape && entry->stable_direct)) {
+        return false;
+    }
     entry->variant = strcmp(fields[5], "portable_c") == 0 ?
         LLMOPT_VARIANT_PORTABLE_C : LLMOPT_VARIANT_X86_64_OPTIMIZED;
     if (!llmopt_variant_available(entry->variant,
@@ -816,6 +842,85 @@ static bool substitute_memcpy(CPUARMState *env, const LlmoptEntry *entry)
     return true;
 }
 
+static bool substitute_lz_match_copy(CPUARMState *env,
+                                     const LlmoptEntry *entry)
+{
+    uint64_t output_address = env->xregs[0];
+    uint64_t length = env->xregs[1];
+    uint64_t distance = env->xregs[2];
+    uint64_t history_address;
+    uint64_t total;
+    size_t history_length;
+    g_autofree uint8_t *scratch = NULL;
+    uint8_t *output = NULL;
+
+    if (!distance || output_address < distance ||
+        length > SIZE_MAX || distance > SIZE_MAX ||
+        length > entry->max_input || distance > entry->max_input ||
+        length > entry->max_input - distance ||
+        output_address + length < output_address) {
+        return false;
+    }
+    if (length == 0) {
+        env->pc = env->xregs[30];
+        return true;
+    }
+    history_address = output_address - distance;
+    total = distance + length;
+    history_length = MIN((uint64_t)length, distance);
+    scratch = g_try_malloc((size_t)total);
+    if (!scratch ||
+        copy_from_user(scratch, history_address, history_length) != 0) {
+        return false;
+    }
+    output = lock_user(VERIFY_WRITE, output_address, length, 1);
+    if (!output ||
+        !llmopt_variant_lz_match_copy(entry->variant,
+                                      scratch + distance, length, distance)) {
+        if (output) {
+            unlock_user(output, output_address, 0);
+        }
+        return false;
+    }
+    memcpy(output, scratch + distance, length);
+    unlock_user(output, output_address, length);
+    env->pc = env->xregs[30];
+    return true;
+}
+
+static bool substitute_memset(CPUARMState *env, const LlmoptEntry *entry)
+{
+    uint64_t output_address = env->xregs[0];
+    uint8_t value = env->xregs[1];
+    uint64_t length = env->xregs[2];
+    g_autofree uint8_t *scratch = NULL;
+    uint8_t *output = NULL;
+
+    if (length > entry->max_input || length > SIZE_MAX ||
+        output_address + length < output_address) {
+        return false;
+    }
+    if (length == 0) {
+        env->xregs[0] = output_address;
+        env->pc = env->xregs[30];
+        return true;
+    }
+    scratch = g_try_malloc(length);
+    output = lock_user(VERIFY_WRITE, output_address, length, 1);
+    if (!scratch || !output ||
+        !llmopt_variant_memset(entry->variant, scratch, value, length)) {
+        if (output) {
+            unlock_user(output, output_address, 0);
+        }
+        return false;
+    }
+    memcpy(output, scratch, length);
+    unlock_user(output, output_address, length);
+    env->xregs[0] = output_address;
+    env->pc = env->xregs[30];
+    return true;
+}
+
 static LlmoptDispatchResult guarded_fallback(vaddr pc, const char *reason)
 {
     runtime.guarded_fallbacks++;
@@ -970,6 +1075,10 @@ LlmoptDispatchResult llmopt_try_dispatch(CPUState *cpu, vaddr pc)
         substituted = substitute_block(env, entry);
     } else if (entry->algorithm == LLMOPT_ALGO_MEMCPY) {
         substituted = substitute_memcpy(env, entry);
+    } else if (entry->algorithm == LLMOPT_ALGO_LZ_MATCH_COPY) {
+        substituted = substitute_lz_match_copy(env, entry);
+    } else if (entry->algorithm == LLMOPT_ALGO_MEMSET) {
+        substituted = substitute_memset(env, entry);
     } else {
         substituted = substitute_scalar(env, entry);
     }

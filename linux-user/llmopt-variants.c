@@ -322,6 +322,12 @@ bool llmopt_variant_available(LlmoptHostVariant variant,
     if (algorithm == LLMOPT_VARIANT_ALGO_MD5) {
         return __builtin_cpu_supports("sse2");
     }
+    if (algorithm == LLMOPT_VARIANT_ALGO_LZ_MATCH_COPY) {
+        return true;
+    }
+    if (algorithm == LLMOPT_VARIANT_ALGO_MEMSET) {
+        return true;
+    }
     return __builtin_cpu_supports("avx2");
 #else
     return false;
@@ -459,6 +465,75 @@ bool llmopt_variant_memcpy(unsigned variant, uint8_t *destination,
 #if defined(__x86_64__)
     if (variant == LLMOPT_VARIANT_X86_64_OPTIMIZED) {
         memcpy_optimized(destination, source, length);
+        return true;
+    }
+#endif
+    return false;
+}
+
+__attribute__((noinline, optimize("no-tree-loop-distribute-patterns")))
+static void lz_match_copy_portable(uint8_t *output, size_t length,
+                                   size_t distance)
+{
+    uint8_t *source = output - distance;
+    while (length--) {
+        *output++ = *source++;
+    }
+}
+
+__attribute__((noinline, optimize("no-tree-loop-distribute-patterns")))
+static void lz_match_copy_optimized(uint8_t *output, size_t length,
+                                    size_t distance)
+{
+    uint8_t *source = output - distance;
+    while (length >= 8 && distance >= 8) {
+        output[0] = source[0]; output[1] = source[1];
+        output[2] = source[2]; output[3] = source[3];
+        output[4] = source[4]; output[5] = source[5];
+        output[6] = source[6]; output[7] = source[7];
+        output += 8; source += 8; length -= 8;
+    }
+    while (length--) {
+        *output++ = *source++;
+    }
+}
+
+bool llmopt_variant_lz_match_copy(unsigned variant, uint8_t *output,
+                                  size_t length, size_t distance)
+{
+    if (!output || !distance ||
+        !llmopt_variant_available(variant, LLMOPT_VARIANT_ALGO_LZ_MATCH_COPY)) {
+        return false;
+    }
+    if (variant == LLMOPT_VARIANT_PORTABLE_C) {
+        lz_match_copy_portable(output, length, distance);
+        return true;
+    }
+#if defined(__x86_64__)
+    if (variant == LLMOPT_VARIANT_X86_64_OPTIMIZED) {
+        lz_match_copy_optimized(output, length, distance);
+        return true;
+    }
+#endif
+    return false;
+}
+
+bool llmopt_variant_memset(unsigned variant, uint8_t *output,
+                           uint8_t value, size_t length)
+{
+    if (!output ||
+        !llmopt_variant_available(variant, LLMOPT_VARIANT_ALGO_MEMSET)) {
+        return false;
+    }
+    if (variant == LLMOPT_VARIANT_PORTABLE_C) {
+        while (length--) {
+            *output++ = value;
+        }
+        return true;
+    }
+#if defined(__x86_64__)
+    if (variant == LLMOPT_VARIANT_X86_64_OPTIMIZED) {
+        memset(output, value, length);
         return true;
     }
 #endif
