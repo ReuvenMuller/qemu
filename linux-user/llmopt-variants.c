@@ -328,6 +328,14 @@ bool llmopt_variant_available(LlmoptHostVariant variant,
     if (algorithm == LLMOPT_VARIANT_ALGO_MEMSET) {
         return true;
     }
+    if (algorithm == LLMOPT_VARIANT_ALGO_XXH64_STREAM) {
+        return variant == LLMOPT_VARIANT_PORTABLE_C ||
+               __builtin_cpu_supports("avx2");
+    }
+    if (algorithm == LLMOPT_VARIANT_ALGO_SHA256_STREAM) {
+        return variant == LLMOPT_VARIANT_PORTABLE_C ||
+               __builtin_cpu_supports("avx2");
+    }
     return __builtin_cpu_supports("avx2");
 #else
     return false;
@@ -538,4 +546,142 @@ bool llmopt_variant_memset(unsigned variant, uint8_t *output,
     }
 #endif
     return false;
+}
+
+typedef struct LlmoptXxh64StreamingState {
+    uint64_t total_len;
+    uint64_t v[4];
+    uint8_t buffer[32];
+    uint32_t memsize;
+    uint32_t reserved32;
+    uint64_t reserved64;
+} LlmoptXxh64StreamingState;
+
+_Static_assert(sizeof(LlmoptXxh64StreamingState) == 88,
+               "pinned XXH64 streaming state layout");
+
+static void xxh64_stream_stripe(LlmoptXxh64StreamingState *state,
+                                const uint8_t *input)
+{
+    state->v[0] = scalar_xxh64_round(state->v[0], load_le64(input));
+    state->v[1] = scalar_xxh64_round(state->v[1], load_le64(input + 8));
+    state->v[2] = scalar_xxh64_round(state->v[2], load_le64(input + 16));
+    state->v[3] = scalar_xxh64_round(state->v[3], load_le64(input + 24));
+}
+
+static bool xxh64_stream_update(LlmoptXxh64StreamingState *state,
+                                const uint8_t *input, size_t length)
+{
+    const uint8_t *current = input;
+    const uint8_t *end;
+
+    if (!input) {
+        return length == 0;
+    }
+    end = input + length;
+    state->total_len += length;
+    if (state->memsize + length < 32) {
+        memcpy(state->buffer + state->memsize, input, length);
+        state->memsize += length;
+        return true;
+    }
+    if (state->memsize) {
+        size_t fill = 32 - state->memsize;
+        memcpy(state->buffer + state->memsize, current, fill);
+        xxh64_stream_stripe(state, state->buffer);
+        current += fill;
+        state->memsize = 0;
+    }
+    if (current + 32 <= end) {
+        const uint8_t *limit = end - 32;
+        do {
+            xxh64_stream_stripe(state, current);
+            current += 32;
+        } while (current <= limit);
+    }
+    if (current < end) {
+        size_t tail = end - current;
+        memcpy(state->buffer, current, tail);
+        state->memsize = tail;
+    }
+    return true;
+}
+
+bool llmopt_variant_xxh64_stream(unsigned variant, uint8_t state[88],
+                                 const uint8_t *input, size_t length)
+{
+    if (!state || !llmopt_variant_available(
+            variant, LLMOPT_VARIANT_ALGO_XXH64_STREAM)) {
+        return false;
+    }
+    return xxh64_stream_update((LlmoptXxh64StreamingState *)state,
+                               input, length);
+}
+
+typedef struct LlmoptSha256StreamingState {
+    uint32_t h[8];
+    uint32_t nl, nh;
+    uint8_t data[64];
+    uint32_t num, md_len;
+} LlmoptSha256StreamingState;
+
+_Static_assert(sizeof(LlmoptSha256StreamingState) == 112,
+               "pinned SHA256_CTX streaming layout");
+
+static bool sha256_stream_update(LlmoptSha256StreamingState *state,
+                                 const uint8_t *input, size_t length)
+{
+    const uint8_t *current = input;
+    uint32_t low;
+    size_t blocks;
+
+    if (length == 0) {
+        return true;
+    }
+    if (!input) {
+        return false;
+    }
+    low = state->nl + ((uint32_t)length << 3);
+    if (low < state->nl) {
+        state->nh++;
+    }
+    state->nh += length >> 29;
+    state->nl = low;
+    if (state->num) {
+        if (length >= 64 || length + state->num >= 64) {
+            size_t fill = 64 - state->num;
+            memcpy(state->data + state->num, current, fill);
+            sha256_portable(state->h, state->data);
+            current += fill;
+            length -= fill;
+            state->num = 0;
+            memset(state->data, 0, sizeof(state->data));
+        } else {
+            memcpy(state->data + state->num, current, length);
+            state->num += length;
+            return true;
+        }
+    }
+    blocks = length / 64;
+    while (blocks--) {
+        sha256_portable(state->h, current);
+        current += 64;
+        length -= 64;
+    }
+    if (length) {
+        state->num = length;
+        memcpy(state->data, current, length);
+    }
+    return true;
+}
+
+bool llmopt_variant_sha256_stream(unsigned variant, uint8_t state[112],
+                                  const uint8_t *input, size_t length)
+{
+    if (!state || !llmopt_variant_available(
+            variant, LLMOPT_VARIANT_ALGO_SHA256_STREAM)) {
+        return false;
+    }
+    return sha256_stream_update((LlmoptSha256StreamingState *)state,
+                                input, length);
 }

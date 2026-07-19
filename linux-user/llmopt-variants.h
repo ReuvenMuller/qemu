@@ -19,6 +19,8 @@ typedef enum LlmoptVariantAlgorithm {
     LLMOPT_VARIANT_ALGO_MEMCPY,
     LLMOPT_VARIANT_ALGO_LZ_MATCH_COPY,
     LLMOPT_VARIANT_ALGO_MEMSET,
+    LLMOPT_VARIANT_ALGO_XXH64_STREAM,
+    LLMOPT_VARIANT_ALGO_SHA256_STREAM,
 } LlmoptVariantAlgorithm;
 
 bool llmopt_variant_available(LlmoptHostVariant variant,
@@ -39,5 +41,9 @@ bool llmopt_variant_lz_match_copy(unsigned variant, uint8_t *output,
                                   size_t length, size_t distance);
 bool llmopt_variant_memset(unsigned variant, uint8_t *output,
                            uint8_t value, size_t length);
+bool llmopt_variant_xxh64_stream(unsigned variant, uint8_t state[88],
+                                 const uint8_t *input, size_t length);
+bool llmopt_variant_sha256_stream(unsigned variant, uint8_t state[112],
+                                  const uint8_t *input, size_t length);
 
 #endif

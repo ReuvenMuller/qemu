@@ -57,6 +57,8 @@ typedef enum LlmoptAlgorithm {
     LLMOPT_ALGO_MEMCPY,
     LLMOPT_ALGO_LZ_MATCH_COPY,
     LLMOPT_ALGO_MEMSET,
+    LLMOPT_ALGO_XXH64_STREAM,
+    LLMOPT_ALGO_SHA256_STREAM,
 } LlmoptAlgorithm;
 
 typedef enum LlmoptIdentityState {
@@ -93,6 +95,8 @@ typedef struct LlmoptEntry {
     bool blocks_x2;
     bool lz_overlap;
     bool memset_shape;
+    bool streaming_xxh64;
+    bool streaming_sha256;
     bool pie_relative;
     bool code_verified;
     size_t page_token_count;
@@ -286,6 +290,12 @@ static bool algorithm_for_catalog(const char *catalog, LlmoptAlgorithm *algo,
     } else if (strcmp(catalog, "memory.memset") == 0) {
         *algo = LLMOPT_ALGO_MEMSET;
         *expected_state = 0;
+    } else if (strcmp(catalog, "digest.xxh64.streaming") == 0) {
+        *algo = LLMOPT_ALGO_XXH64_STREAM;
+        *expected_state = 88;
+    } else if (strcmp(catalog, "digest.sha256.streaming") == 0) {
+        *algo = LLMOPT_ALGO_SHA256_STREAM;
+        *expected_state = 112;
     } else {
         return false;
     }
@@ -311,6 +321,10 @@ static LlmoptVariantAlgorithm variant_algorithm(LlmoptAlgorithm algorithm)
         return LLMOPT_VARIANT_ALGO_LZ_MATCH_COPY;
     case LLMOPT_ALGO_MEMSET:
         return LLMOPT_VARIANT_ALGO_MEMSET;
+    case LLMOPT_ALGO_XXH64_STREAM:
+        return LLMOPT_VARIANT_ALGO_XXH64_STREAM;
+    case LLMOPT_ALGO_SHA256_STREAM:
+        return LLMOPT_VARIANT_ALGO_SHA256_STREAM;
     default:
         g_assert_not_reached();
     }
@@ -348,7 +362,9 @@ static bool parse_entry_line(const char *line, LlmoptEntry *entry)
         (strcmp(fields[9], "single") != 0 &&
          strcmp(fields[9], "blocks_x2") != 0 &&
          strcmp(fields[9], "lz_overlap") != 0 &&
-         strcmp(fields[9], "memset") != 0) ||
+         strcmp(fields[9], "memset") != 0 &&
+         strcmp(fields[9], "streaming_xxh64") != 0 &&
+         strcmp(fields[9], "streaming_sha256") != 0) ||
         (strcmp(fields[13], "stable_direct") != 0 &&
          strcmp(fields[13], "transactional_copy") != 0)) {
         return false;
@@ -357,6 +373,8 @@ static bool parse_entry_line(const char *line, LlmoptEntry *entry)
     entry->blocks_x2 = strcmp(fields[9], "blocks_x2") == 0;
     entry->lz_overlap = strcmp(fields[9], "lz_overlap") == 0;
     entry->memset_shape = strcmp(fields[9], "memset") == 0;
+    entry->streaming_xxh64 = strcmp(fields[9], "streaming_xxh64") == 0;
+    entry->streaming_sha256 = strcmp(fields[9], "streaming_sha256") == 0;
     entry->stable_direct = strcmp(fields[13], "stable_direct") == 0;
     if (entry->lz_overlap != (entry->algorithm == LLMOPT_ALGO_LZ_MATCH_COPY) ||
         (entry->lz_overlap && entry->stable_direct)) {
@@ -364,6 +382,14 @@ static bool parse_entry_line(const char *line, LlmoptEntry *entry)
     }
     if (entry->memset_shape != (entry->algorithm == LLMOPT_ALGO_MEMSET) ||
         (entry->memset_shape && entry->stable_direct)) {
+        return false;
+    }
+    if (entry->streaming_xxh64 !=
+            (entry->algorithm == LLMOPT_ALGO_XXH64_STREAM)) {
+        return false;
+    }
+    if (entry->streaming_sha256 !=
+            (entry->algorithm == LLMOPT_ALGO_SHA256_STREAM)) {
         return false;
     }
     entry->variant = strcmp(fields[5], "portable_c") == 0 ?
@@ -1090,6 +1116,110 @@ static bool substitute_memset(CPUARMState *env, const LlmoptEntry *entry)
     return true;
 }
 
+static bool substitute_xxh64_stream(CPUARMState *env,
+                                    const LlmoptEntry *entry)
+{
+    uint64_t state_address = env->xregs[0];
+    uint64_t input_address = env->xregs[1];
+    uint64_t length = env->xregs[2];
+    uint8_t local_state[88] __attribute__((aligned(8)));
+    g_autofree uint8_t *copied_input = NULL;
+    uint8_t *input = NULL;
+    uint8_t *state = NULL;
+
+    if ((state_address & 7) || length > entry->max_input ||
+        length > SIZE_MAX || state_address + sizeof(local_state) < state_address ||
+        input_address + length < input_address ||
+        ranges_overlap(state_address, sizeof(local_state), input_address, length)) {
+        return false;
+    }
+    state = lock_user(VERIFY_WRITE, state_address, sizeof(local_state), 1);
+    if (!state) {
+        return false;
+    }
+    memcpy(local_state, state, sizeof(local_state));
+    if (length) {
+        if (entry->stable_direct) {
+            input = lock_user(VERIFY_READ, input_address, length, 0);
+        } else {
+            copied_input = copy_input(input_address, length, entry->max_input);
+            input = copied_input;
+        }
+        if (!input) {
+            unlock_user(state, state_address, 0);
+            return false;
+        }
+    }
+    if (!llmopt_variant_xxh64_stream(entry->variant, local_state,
+                                     input, length)) {
+        if (entry->stable_direct && input) {
+            unlock_user(input, input_address, 0);
+        }
+        unlock_user(state, state_address, 0);
+        return false;
+    }
+    if (entry->stable_direct && input) {
+        unlock_user(input, input_address, 0);
+    }
+    memcpy(state, local_state, sizeof(local_state));
+    unlock_user(state, state_address, sizeof(local_state));
+    env->xregs[0] = 0;
+    env->pc = env->xregs[30];
+    return true;
+}
+
+static bool substitute_sha256_stream(CPUARMState *env,
+                                     const LlmoptEntry *entry)
+{
+    uint64_t state_address = env->xregs[0];
+    uint64_t input_address = env->xregs[1];
+    uint64_t length = env->xregs[2];
+    uint8_t local_state[112] __attribute__((aligned(8)));
+    g_autofree uint8_t *copied_input = NULL;
+    uint8_t *input = NULL;
+    uint8_t *state;
+
+    if ((state_address & 3) || length > entry->max_input || length > SIZE_MAX ||
+        state_address + sizeof(local_state) < state_address ||
+        input_address + length < input_address ||
+        ranges_overlap(state_address, sizeof(local_state), input_address, length)) {
+        return false;
+    }
+    state = lock_user(VERIFY_WRITE, state_address, sizeof(local_state), 1);
+    if (!state) {
+        return false;
+    }
+    memcpy(local_state, state, sizeof(local_state));
+    if (length) {
+        if (entry->stable_direct) {
+            input = lock_user(VERIFY_READ, input_address, length, 0);
+        } else {
+            copied_input = copy_input(input_address, length, entry->max_input);
+            input = copied_input;
+        }
+        if (!input) {
+            unlock_user(state, state_address, 0);
+            return false;
+        }
+    }
+    if (!llmopt_variant_sha256_stream(entry->variant, local_state,
+                                      input, length)) {
+        if (entry->stable_direct && input) {
+            unlock_user(input, input_address, 0);
+        }
+        unlock_user(state, state_address, 0);
+        return false;
+    }
+    if (entry->stable_direct && input) {
+        unlock_user(input, input_address, 0);
+    }
+    memcpy(state, local_state, sizeof(local_state));
+    unlock_user(state, state_address, sizeof(local_state));
+    env->xregs[0] = 1;
+    env->pc = env->xregs[30];
+    return true;
+}
+
 static LlmoptDispatchResult guarded_fallback(vaddr pc, const char *reason)
 {
     runtime.guarded_fallbacks++;
@@ -1234,10 +1364,19 @@ LlmoptDispatchResult llmopt_try_dispatch(CPUState *cpu, vaddr pc)
         runtime.code_rejects++;
         return guarded_fallback(pc, "exact_entry_bytes_unverified");
     }
+    bool one_guest_cpu = single_guest_cpu();
     if (runtime.debugger_active || cpu->singlestep_enabled ||
         !QTAILQ_EMPTY(&cpu->watchpoints) ||
         qatomic_read(&task->signal_pending) ||
-        qatomic_read(&cpu->exit_request) || !single_guest_cpu()) {
+        qatomic_read(&cpu->exit_request) || !one_guest_cpu) {
+        if (runtime.trace) {
+            fprintf(stderr, "LLMOPT_RUNTIME_STATE debugger=%u singlestep=%u "
+                    "watchpoints=%u signal_pending=%u exit_request=%u single_guest_cpu=%u\n",
+                    runtime.debugger_active, cpu->singlestep_enabled,
+                    !QTAILQ_EMPTY(&cpu->watchpoints),
+                    qatomic_read(&task->signal_pending),
+                    qatomic_read(&cpu->exit_request), one_guest_cpu);
+        }
         runtime.state_rejects++;
         return guarded_fallback(pc, "runtime_state");
     }
@@ -1269,6 +1408,10 @@ LlmoptDispatchResult llmopt_try_dispatch(CPUState *cpu, vaddr pc)
         substituted = substitute_lz_match_copy(env, entry);
     } else if (entry->algorithm == LLMOPT_ALGO_MEMSET) {
         substituted = substitute_memset(env, entry);
+    } else if (entry->algorithm == LLMOPT_ALGO_XXH64_STREAM) {
+        substituted = substitute_xxh64_stream(env, entry);
+    } else if (entry->algorithm == LLMOPT_ALGO_SHA256_STREAM) {
+        substituted = substitute_sha256_stream(env, entry);
     } else {
         substituted = substitute_scalar(env, entry);
     }
