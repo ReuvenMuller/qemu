@@ -9,6 +9,8 @@
 
 #include "llmopt-variants.h"
 
+#include <math.h>
+
 static inline uint32_t rotl32(uint32_t value, unsigned count)
 {
     return (value << count) | (value >> (32 - count));
@@ -335,6 +337,9 @@ bool llmopt_variant_available(LlmoptHostVariant variant,
     if (algorithm == LLMOPT_VARIANT_ALGO_SHA256_STREAM) {
         return variant == LLMOPT_VARIANT_PORTABLE_C ||
                __builtin_cpu_supports("avx2");
+    }
+    if (algorithm == LLMOPT_VARIANT_ALGO_FP_SAMPLERATE) {
+        return __builtin_cpu_supports("fma");
     }
     return __builtin_cpu_supports("avx2");
 #else
@@ -684,4 +689,307 @@ bool llmopt_variant_sha256_stream(unsigned variant, uint8_t state[112],
     }
     return sha256_stream_update((LlmoptSha256StreamingState *)state,
                                 input, length);
+}
+
+/* Exact host mirror of the pinned libsamplerate 2ccde956 mono call shape. */
+typedef struct LlmoptSamplerateState {
+    void *vt;
+    double last_ratio, last_position;
+    int32_t error;
+    int32_t channels;
+    int32_t mode;
+    int32_t padding;
+    void *callback_func;
+    void *user_callback_data;
+    int64_t saved_frames;
+    const float *saved_data;
+    void *private_data;
+} LlmoptSamplerateState;
+
+typedef struct LlmoptSamplerateData {
+    const float *data_in;
+    float *data_out;
+    int64_t input_frames, output_frames;
+    int64_t input_frames_used, output_frames_gen;
+    int32_t end_of_input;
+    int32_t padding;
+    double src_ratio;
+} LlmoptSamplerateData;
+
+typedef struct LlmoptSincFilter {
+    int32_t sinc_magic_marker;
+    int32_t padding;
+    int64_t in_count, in_used;
+    int64_t out_count, out_gen;
+    int32_t coeff_half_len, index_inc;
+    double src_ratio, input_index;
+    const float *coeffs;
+    int32_t b_current, b_end, b_real_end, b_len;
+    double left_calc[128], right_calc[128];
+    float *buffer;
+} LlmoptSincFilter;
+
+_Static_assert(sizeof(LlmoptSamplerateState) == 80,
+               "pinned SRC_STATE layout");
+_Static_assert(offsetof(LlmoptSamplerateState, private_data) == 72,
+               "pinned SRC_STATE private_data offset");
+_Static_assert(sizeof(LlmoptSamplerateData) == 64,
+               "pinned SRC_DATA layout");
+_Static_assert(offsetof(LlmoptSamplerateData, src_ratio) == 56,
+               "pinned SRC_DATA ratio offset");
+_Static_assert(sizeof(LlmoptSincFilter) == 2144,
+               "pinned SINC_FILTER layout");
+_Static_assert(offsetof(LlmoptSincFilter, coeffs) == 64,
+               "pinned SINC_FILTER coefficient offset");
+_Static_assert(offsetof(LlmoptSincFilter, buffer) == 2136,
+               "pinned SINC_FILTER buffer offset");
+
+static inline int32_t samplerate_lrint(double value)
+{
+    return (int32_t)lrint(value);
+}
+
+static inline double samplerate_fmod_one(double value)
+{
+    double result = value - samplerate_lrint(value);
+    return result < 0.0 ? result + 1.0 : result;
+}
+
+static inline int32_t samplerate_double_to_fp(double value)
+{
+    return samplerate_lrint(value * 4096.0);
+}
+
+static inline double samplerate_fp_fraction(int32_t value)
+{
+    return (value & 4095) * (1.0 / 4096.0);
+}
+
+static inline double samplerate_fma_portable(double a, double b, double c)
+{
+    return fma(a, b, c);
+}
+
+#if defined(__x86_64__)
+__attribute__((target("fma")))
+static double samplerate_fma_optimized(double a, double b, double c)
+{
+    return __builtin_fma(a, b, c);
+}
+#endif
+
+static inline double samplerate_fma(unsigned variant,
+                                    double a, double b, double c)
+{
+#if defined(__x86_64__)
+    if (variant == LLMOPT_VARIANT_X86_64_OPTIMIZED) {
+        return samplerate_fma_optimized(a, b, c);
+    }
+#endif
+    return samplerate_fma_portable(a, b, c);
+}
+
+static double samplerate_calc_output(unsigned variant,
+                                     LlmoptSincFilter *filter,
+                                     int32_t increment,
+                                     int32_t start_filter_index)
+{
+    int32_t max_filter_index = filter->coeff_half_len << 12;
+    int32_t filter_index = start_filter_index;
+    int32_t coeff_count = (max_filter_index - filter_index) / increment;
+    int32_t data_index;
+    double left = 0.0, right = 0.0;
+
+    filter_index += coeff_count * increment;
+    data_index = filter->b_current - coeff_count;
+    do {
+        double fraction = samplerate_fp_fraction(filter_index);
+        int32_t index = filter_index >> 12;
+        double base = filter->coeffs[index];
+        double difference = (double)(filter->coeffs[index + 1] -
+                                     filter->coeffs[index]);
+        double coefficient = samplerate_fma(variant, fraction,
+                                             difference, base);
+        left = samplerate_fma(variant, coefficient,
+                              filter->buffer[data_index], left);
+        filter_index -= increment;
+        data_index++;
+    } while (filter_index >= 0);
+
+    filter_index = increment - start_filter_index;
+    coeff_count = (max_filter_index - filter_index) / increment;
+    filter_index += coeff_count * increment;
+    data_index = filter->b_current + 1 + coeff_count;
+    do {
+        double fraction = samplerate_fp_fraction(filter_index);
+        int32_t index = filter_index >> 12;
+        double base = filter->coeffs[index];
+        double difference = (double)(filter->coeffs[index + 1] -
+                                     filter->coeffs[index]);
+        double coefficient = samplerate_fma(variant, fraction,
+                                             difference, base);
+        right = samplerate_fma(variant, coefficient,
+                               filter->buffer[data_index], right);
+        filter_index -= increment;
+        data_index--;
+    } while (filter_index > 0);
+    return left + right;
+}
+
+static int32_t samplerate_prepare_data(LlmoptSincFilter *filter,
+                                       int channels,
+                                       LlmoptSamplerateData *data,
+                                       int half_filter_chan_len)
+{
+    int len = 0;
+
+    if (filter->b_real_end >= 0 || data->data_in == NULL) {
+        return 0;
+    }
+    if (filter->b_current == 0) {
+        len = filter->b_len - 2 * half_filter_chan_len;
+        filter->b_current = filter->b_end = half_filter_chan_len;
+    } else if (filter->b_end + half_filter_chan_len + channels < filter->b_len) {
+        len = filter->b_len - filter->b_current - half_filter_chan_len;
+        if (len < 0) {
+            len = 0;
+        }
+    } else {
+        len = filter->b_end - filter->b_current;
+        memmove(filter->buffer,
+                filter->buffer + filter->b_current - half_filter_chan_len,
+                (half_filter_chan_len + len) * sizeof(*filter->buffer));
+        filter->b_current = half_filter_chan_len;
+        filter->b_end = filter->b_current + len;
+        len = filter->b_len - filter->b_current - half_filter_chan_len;
+        if (len < 0) {
+            len = 0;
+        }
+    }
+    if (filter->in_count - filter->in_used < len) {
+        len = filter->in_count - filter->in_used;
+    }
+    len -= len % channels;
+    if (len < 0 || filter->b_end + len > filter->b_len) {
+        return 22;
+    }
+    memcpy(filter->buffer + filter->b_end,
+           data->data_in + filter->in_used,
+           len * sizeof(*filter->buffer));
+    filter->b_end += len;
+    filter->in_used += len;
+    if (filter->in_used == filter->in_count &&
+        filter->b_end - filter->b_current < 2 * half_filter_chan_len &&
+        data->end_of_input) {
+        if (filter->b_len - filter->b_end < half_filter_chan_len + 5) {
+            len = filter->b_end - filter->b_current;
+            memmove(filter->buffer,
+                    filter->buffer + filter->b_current - half_filter_chan_len,
+                    (half_filter_chan_len + len) * sizeof(*filter->buffer));
+            filter->b_current = half_filter_chan_len;
+            filter->b_end = filter->b_current + len;
+        }
+        filter->b_real_end = filter->b_end;
+        len = half_filter_chan_len + 5;
+        if (filter->b_end + len > filter->b_len) {
+            len = filter->b_len - filter->b_end;
+        }
+        memset(filter->buffer + filter->b_end, 0,
+               len * sizeof(*filter->buffer));
+        filter->b_end += len;
+    }
+    return 0;
+}
+
+bool llmopt_variant_fp_samplerate(unsigned variant, uint8_t state_bytes[80],
+                                  uint8_t data_bytes[64],
+                                  uint8_t filter_bytes[2144],
+                                  const float *coefficients,
+                                  size_t coefficient_count,
+                                  float *buffer, size_t buffer_count,
+                                  const float *input, size_t input_count,
+                                  float *output, size_t output_count)
+{
+    LlmoptSamplerateState *state = (LlmoptSamplerateState *)state_bytes;
+    LlmoptSamplerateData *data = (LlmoptSamplerateData *)data_bytes;
+    LlmoptSincFilter *filter = (LlmoptSincFilter *)filter_bytes;
+    double input_index, src_ratio, count, float_increment, terminate, rem;
+    int32_t increment, start_filter_index;
+    int half_filter_chan_len, samples_in_hand;
+
+    if (!state || !data || !filter || !coefficients || !buffer || !output ||
+        !llmopt_variant_available(variant, LLMOPT_VARIANT_ALGO_FP_SAMPLERATE) ||
+        state->channels != 1 || filter->coeff_half_len < 1 ||
+        filter->index_inc <= 0 || coefficient_count < (size_t)filter->coeff_half_len + 2 ||
+        buffer_count != (size_t)filter->b_len ||
+        input_count < (size_t)data->input_frames ||
+        output_count < (size_t)data->output_frames) {
+        return false;
+    }
+    state->private_data = filter;
+    data->data_in = input;
+    data->data_out = output;
+    filter->coeffs = coefficients;
+    filter->buffer = buffer;
+    filter->in_count = data->input_frames;
+    filter->out_count = data->output_frames;
+    filter->in_used = filter->out_gen = 0;
+    src_ratio = state->last_ratio;
+    if (src_ratio < 1.0 / 256.0 || src_ratio > 256.0) {
+        return false;
+    }
+    count = (filter->coeff_half_len + 2.0) / filter->index_inc;
+    if ((state->last_ratio < data->src_ratio ? state->last_ratio : data->src_ratio) < 1.0) {
+        count /= state->last_ratio < data->src_ratio ? state->last_ratio : data->src_ratio;
+    }
+    half_filter_chan_len = samplerate_lrint(count) + 1;
+    input_index = state->last_position;
+    rem = samplerate_fmod_one(input_index);
+    filter->b_current = (filter->b_current +
+        samplerate_lrint(input_index - rem)) % filter->b_len;
+    input_index = rem;
+    terminate = 1.0 / src_ratio + 1e-20;
+    while (filter->out_gen < filter->out_count) {
+        samples_in_hand = (filter->b_end - filter->b_current + filter->b_len) % filter->b_len;
+        if (samples_in_hand <= half_filter_chan_len) {
+            state->error = samplerate_prepare_data(filter, 1, data,
+                                                    half_filter_chan_len);
+            if (state->error != 0) {
+                return false;
+            }
+            samples_in_hand = (filter->b_end - filter->b_current + filter->b_len) % filter->b_len;
+            if (samples_in_hand <= half_filter_chan_len) {
+                break;
+            }
+        }
+        if (filter->b_real_end >= 0 &&
+            filter->b_current + input_index + terminate > filter->b_real_end) {
+            break;
+        }
+        if (filter->out_count > 0 &&
+            fabs(state->last_ratio - data->src_ratio) > 1e-10) {
+            volatile double product = filter->out_gen *
+                (data->src_ratio - state->last_ratio);
+            volatile double quotient = product / filter->out_count;
+            src_ratio = state->last_ratio + quotient;
+        }
+        float_increment = filter->index_inc *
+            (src_ratio < 1.0 ? src_ratio : 1.0);
+        increment = samplerate_double_to_fp(float_increment);
+        start_filter_index = samplerate_double_to_fp(input_index * float_increment);
+        output[filter->out_gen] = (float)((float_increment / filter->index_inc) *
+            samplerate_calc_output(variant, filter, increment,
+                                   start_filter_index));
+        filter->out_gen++;
+        input_index += 1.0 / src_ratio;
+        rem = samplerate_fmod_one(input_index);
+        filter->b_current = (filter->b_current +
+            samplerate_lrint(input_index - rem)) % filter->b_len;
+        input_index = rem;
+    }
+    state->last_position = input_index;
+    state->last_ratio = src_ratio;
+    data->input_frames_used = filter->in_used;
+    data->output_frames_gen = filter->out_gen;
+    return true;
 }

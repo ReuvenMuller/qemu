@@ -21,6 +21,7 @@ typedef enum LlmoptVariantAlgorithm {
     LLMOPT_VARIANT_ALGO_MEMSET,
     LLMOPT_VARIANT_ALGO_XXH64_STREAM,
     LLMOPT_VARIANT_ALGO_SHA256_STREAM,
+    LLMOPT_VARIANT_ALGO_FP_SAMPLERATE,
 } LlmoptVariantAlgorithm;
 
 bool llmopt_variant_available(LlmoptHostVariant variant,
@@ -45,5 +46,12 @@ bool llmopt_variant_xxh64_stream(unsigned variant, uint8_t state[88],
                                  const uint8_t *input, size_t length);
 bool llmopt_variant_sha256_stream(unsigned variant, uint8_t state[112],
                                   const uint8_t *input, size_t length);
+bool llmopt_variant_fp_samplerate(unsigned variant, uint8_t state[80],
+                                  uint8_t data[64], uint8_t filter[2144],
+                                  const float *coefficients,
+                                  size_t coefficient_count,
+                                  float *buffer, size_t buffer_count,
+                                  const float *input, size_t input_count,
+                                  float *output, size_t output_count);
 
 #endif

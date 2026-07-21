@@ -17,6 +17,9 @@
 #include "user/page-protection.h"
 #include "llmopt-variants.h"
 
+#include <fenv.h>
+#include <math.h>
+
 #define LLMOPT_MAX_ENTRIES 64
 #define LLMOPT_MAX_MAP_BYTES (1024 * 1024)
 #define LLMOPT_MAX_CODE_PAGES 257
@@ -59,6 +62,7 @@ typedef enum LlmoptAlgorithm {
     LLMOPT_ALGO_MEMSET,
     LLMOPT_ALGO_XXH64_STREAM,
     LLMOPT_ALGO_SHA256_STREAM,
+    LLMOPT_ALGO_FP_SAMPLERATE,
 } LlmoptAlgorithm;
 
 typedef enum LlmoptIdentityState {
@@ -97,6 +101,7 @@ typedef struct LlmoptEntry {
     bool memset_shape;
     bool streaming_xxh64;
     bool streaming_sha256;
+    bool fp_samplerate;
     bool pie_relative;
     bool code_verified;
     size_t page_token_count;
@@ -296,6 +301,9 @@ static bool algorithm_for_catalog(const char *catalog, LlmoptAlgorithm *algo,
     } else if (strcmp(catalog, "digest.sha256.streaming") == 0) {
         *algo = LLMOPT_ALGO_SHA256_STREAM;
         *expected_state = 112;
+    } else if (strcmp(catalog, "fp.samplerate.sinc_mono") == 0) {
+        *algo = LLMOPT_ALGO_FP_SAMPLERATE;
+        *expected_state = 80;
     } else {
         return false;
     }
@@ -325,6 +333,8 @@ static LlmoptVariantAlgorithm variant_algorithm(LlmoptAlgorithm algorithm)
         return LLMOPT_VARIANT_ALGO_XXH64_STREAM;
     case LLMOPT_ALGO_SHA256_STREAM:
         return LLMOPT_VARIANT_ALGO_SHA256_STREAM;
+    case LLMOPT_ALGO_FP_SAMPLERATE:
+        return LLMOPT_VARIANT_ALGO_FP_SAMPLERATE;
     default:
         g_assert_not_reached();
     }
@@ -364,7 +374,8 @@ static bool parse_entry_line(const char *line, LlmoptEntry *entry)
          strcmp(fields[9], "lz_overlap") != 0 &&
          strcmp(fields[9], "memset") != 0 &&
          strcmp(fields[9], "streaming_xxh64") != 0 &&
-         strcmp(fields[9], "streaming_sha256") != 0) ||
+         strcmp(fields[9], "streaming_sha256") != 0 &&
+         strcmp(fields[9], "fp_samplerate") != 0) ||
         (strcmp(fields[13], "stable_direct") != 0 &&
          strcmp(fields[13], "transactional_copy") != 0)) {
         return false;
@@ -375,6 +386,7 @@ static bool parse_entry_line(const char *line, LlmoptEntry *entry)
     entry->memset_shape = strcmp(fields[9], "memset") == 0;
     entry->streaming_xxh64 = strcmp(fields[9], "streaming_xxh64") == 0;
     entry->streaming_sha256 = strcmp(fields[9], "streaming_sha256") == 0;
+    entry->fp_samplerate = strcmp(fields[9], "fp_samplerate") == 0;
     entry->stable_direct = strcmp(fields[13], "stable_direct") == 0;
     if (entry->lz_overlap != (entry->algorithm == LLMOPT_ALGO_LZ_MATCH_COPY) ||
         (entry->lz_overlap && entry->stable_direct)) {
@@ -390,6 +402,11 @@ static bool parse_entry_line(const char *line, LlmoptEntry *entry)
     }
     if (entry->streaming_sha256 !=
             (entry->algorithm == LLMOPT_ALGO_SHA256_STREAM)) {
+        return false;
+    }
+    if (entry->fp_samplerate !=
+            (entry->algorithm == LLMOPT_ALGO_FP_SAMPLERATE) ||
+        (entry->fp_samplerate && !entry->stable_direct)) {
         return false;
     }
     entry->variant = strcmp(fields[5], "portable_c") == 0 ?
@@ -1220,6 +1237,264 @@ static bool substitute_sha256_stream(CPUARMState *env,
     return true;
 }
 
+typedef struct LlmoptSamplerateStateAdapter {
+    void *vt;
+    double last_ratio, last_position;
+    int32_t error, channels, mode, padding;
+    void *callback_func, *user_callback_data;
+    int64_t saved_frames;
+    const float *saved_data;
+    void *private_data;
+} LlmoptSamplerateStateAdapter;
+
+typedef struct LlmoptSamplerateDataAdapter {
+    const float *data_in;
+    float *data_out;
+    int64_t input_frames, output_frames;
+    int64_t input_frames_used, output_frames_gen;
+    int32_t end_of_input, padding;
+    double src_ratio;
+} LlmoptSamplerateDataAdapter;
+
+typedef struct LlmoptSincFilterAdapter {
+    int32_t sinc_magic_marker, padding;
+    int64_t in_count, in_used, out_count, out_gen;
+    int32_t coeff_half_len, index_inc;
+    double src_ratio, input_index;
+    const float *coeffs;
+    int32_t b_current, b_end, b_real_end, b_len;
+    double left_calc[128], right_calc[128];
+    float *buffer;
+} LlmoptSincFilterAdapter;
+
+_Static_assert(sizeof(LlmoptSamplerateStateAdapter) == 80,
+               "pinned SRC_STATE adapter layout");
+_Static_assert(sizeof(LlmoptSamplerateDataAdapter) == 64,
+               "pinned SRC_DATA adapter layout");
+_Static_assert(sizeof(LlmoptSincFilterAdapter) == 2144,
+               "pinned SINC_FILTER adapter layout");
+
+static bool fp_float_domain_ok(const float *values, size_t count)
+{
+    for (size_t i = 0; i < count; i++) {
+        if (values[i] != 0.0f && !isnormal(values[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool fp_double_domain_ok(double value)
+{
+    return value == 0.0 || isnormal(value);
+}
+
+static bool substitute_fp_samplerate(CPUARMState *env,
+                                     const LlmoptEntry *entry)
+{
+    uint64_t state_address = env->xregs[0];
+    uint64_t data_address = env->xregs[1];
+    uint64_t filter_address, input_address, output_address;
+    uint64_t coeff_address, buffer_address;
+    uint8_t local_state_bytes[80] __attribute__((aligned(8)));
+    uint8_t local_data_bytes[64] __attribute__((aligned(8)));
+    uint8_t local_filter_bytes[2144] __attribute__((aligned(8)));
+    LlmoptSamplerateStateAdapter *local_state =
+        (LlmoptSamplerateStateAdapter *)local_state_bytes;
+    LlmoptSamplerateDataAdapter *local_data =
+        (LlmoptSamplerateDataAdapter *)local_data_bytes;
+    LlmoptSincFilterAdapter *local_filter =
+        (LlmoptSincFilterAdapter *)local_filter_bytes;
+    uint8_t *state = NULL, *data = NULL, *filter = NULL;
+    float *input = NULL, *coefficients = NULL;
+    float *guest_buffer = NULL, *guest_output = NULL;
+    g_autofree float *scratch_buffer = NULL;
+    g_autofree float *scratch_output = NULL;
+    size_t input_count, output_count, coefficient_count, buffer_count;
+    size_t input_bytes, output_bytes, coefficient_bytes, buffer_bytes;
+    size_t committed_output_bytes = 0;
+    fenv_t saved_fenv;
+    int host_exceptions = 0;
+    bool variant_ok = false, success = false;
+
+    if (vfp_get_fpcr(env) != 0 || fegetround() != FE_TONEAREST ||
+        (state_address & 7) || (data_address & 7) ||
+        state_address + sizeof(local_state_bytes) < state_address ||
+        data_address + sizeof(local_data_bytes) < data_address ||
+        ranges_overlap(state_address, sizeof(local_state_bytes),
+                       data_address, sizeof(local_data_bytes))) {
+        return false;
+    }
+    state = lock_user(VERIFY_WRITE, state_address,
+                      sizeof(local_state_bytes), 1);
+    data = lock_user(VERIFY_WRITE, data_address,
+                     sizeof(local_data_bytes), 1);
+    if (!state || !data) {
+        goto done;
+    }
+    memcpy(local_state_bytes, state, sizeof(local_state_bytes));
+    memcpy(local_data_bytes, data, sizeof(local_data_bytes));
+    filter_address = (uintptr_t)local_state->private_data;
+    input_address = (uintptr_t)local_data->data_in;
+    output_address = (uintptr_t)local_data->data_out;
+    if (!filter_address || !input_address || !output_address ||
+        (filter_address & 7) ||
+        filter_address + sizeof(local_filter_bytes) < filter_address ||
+        local_state->channels != 1 ||
+        local_data->input_frames <= 0 || local_data->output_frames <= 0 ||
+        (uint64_t)local_data->input_frames > SIZE_MAX / sizeof(float) ||
+        (uint64_t)local_data->output_frames > SIZE_MAX / sizeof(float)) {
+        goto done;
+    }
+    input_count = local_data->input_frames;
+    output_count = local_data->output_frames;
+    input_bytes = input_count * sizeof(float);
+    output_bytes = output_count * sizeof(float);
+    if (input_bytes > entry->max_input || output_bytes > entry->max_input ||
+        input_address + input_bytes < input_address ||
+        output_address + output_bytes < output_address) {
+        goto done;
+    }
+    filter = lock_user(VERIFY_WRITE, filter_address,
+                       sizeof(local_filter_bytes), 1);
+    if (!filter) {
+        goto done;
+    }
+    memcpy(local_filter_bytes, filter, sizeof(local_filter_bytes));
+    coeff_address = (uintptr_t)local_filter->coeffs;
+    buffer_address = (uintptr_t)local_filter->buffer;
+    if (!coeff_address || !buffer_address || (coeff_address & 3) ||
+        (buffer_address & 3) || local_filter->coeff_half_len < 1 ||
+        local_filter->b_len <= 0 || local_filter->index_inc <= 0 ||
+        local_filter->b_current < 0 || local_filter->b_current >= local_filter->b_len ||
+        local_filter->b_end < 0 || local_filter->b_end > local_filter->b_len ||
+        local_filter->b_real_end < -1 || local_filter->b_real_end > local_filter->b_len) {
+        goto done;
+    }
+    coefficient_count = (size_t)local_filter->coeff_half_len + 2;
+    buffer_count = local_filter->b_len;
+    if (coefficient_count > SIZE_MAX / sizeof(float) ||
+        buffer_count > SIZE_MAX / sizeof(float)) {
+        goto done;
+    }
+    coefficient_bytes = coefficient_count * sizeof(float);
+    buffer_bytes = buffer_count * sizeof(float);
+    if (coefficient_bytes > entry->max_input || buffer_bytes > entry->max_input ||
+        coeff_address + coefficient_bytes < coeff_address ||
+        buffer_address + buffer_bytes < buffer_address) {
+        goto done;
+    }
+    if (ranges_overlap(state_address, sizeof(local_state_bytes),
+                       filter_address, sizeof(local_filter_bytes)) ||
+        ranges_overlap(state_address, sizeof(local_state_bytes), input_address, input_bytes) ||
+        ranges_overlap(state_address, sizeof(local_state_bytes), output_address, output_bytes) ||
+        ranges_overlap(state_address, sizeof(local_state_bytes), coeff_address, coefficient_bytes) ||
+        ranges_overlap(state_address, sizeof(local_state_bytes), buffer_address, buffer_bytes) ||
+        ranges_overlap(data_address, sizeof(local_data_bytes),
+                       filter_address, sizeof(local_filter_bytes)) ||
+        ranges_overlap(data_address, sizeof(local_data_bytes), input_address, input_bytes) ||
+        ranges_overlap(data_address, sizeof(local_data_bytes), output_address, output_bytes) ||
+        ranges_overlap(data_address, sizeof(local_data_bytes), coeff_address, coefficient_bytes) ||
+        ranges_overlap(data_address, sizeof(local_data_bytes), buffer_address, buffer_bytes) ||
+        ranges_overlap(filter_address, sizeof(local_filter_bytes), input_address, input_bytes) ||
+        ranges_overlap(filter_address, sizeof(local_filter_bytes), output_address, output_bytes) ||
+        ranges_overlap(filter_address, sizeof(local_filter_bytes), coeff_address, coefficient_bytes) ||
+        ranges_overlap(filter_address, sizeof(local_filter_bytes), buffer_address, buffer_bytes) ||
+        ranges_overlap(input_address, input_bytes, output_address, output_bytes) ||
+        ranges_overlap(input_address, input_bytes, coeff_address, coefficient_bytes) ||
+        ranges_overlap(buffer_address, buffer_bytes, input_address, input_bytes) ||
+        ranges_overlap(buffer_address, buffer_bytes, output_address, output_bytes) ||
+        ranges_overlap(coeff_address, coefficient_bytes, buffer_address, buffer_bytes) ||
+        ranges_overlap(coeff_address, coefficient_bytes, output_address, output_bytes)) {
+        goto done;
+    }
+    input = lock_user(VERIFY_READ, input_address, input_bytes, 0);
+    coefficients = lock_user(VERIFY_READ, coeff_address,
+                             coefficient_bytes, 0);
+    guest_buffer = lock_user(VERIFY_WRITE, buffer_address, buffer_bytes, 1);
+    guest_output = lock_user(VERIFY_WRITE, output_address, output_bytes, 1);
+    scratch_buffer = g_try_malloc(buffer_bytes);
+    scratch_output = g_try_malloc0(output_bytes);
+    if (!input || !coefficients || !guest_buffer || !guest_output ||
+        !scratch_buffer || !scratch_output) {
+        goto done;
+    }
+    memcpy(scratch_buffer, guest_buffer, buffer_bytes);
+    if (!fp_double_domain_ok(local_state->last_ratio) ||
+        !fp_double_domain_ok(local_state->last_position) ||
+        !fp_double_domain_ok(local_data->src_ratio) ||
+        !fp_float_domain_ok(input, input_count) ||
+        !fp_float_domain_ok(coefficients, coefficient_count) ||
+        !fp_float_domain_ok(scratch_buffer, buffer_count)) {
+        goto done;
+    }
+    if (fegetenv(&saved_fenv) != 0 || feclearexcept(FE_ALL_EXCEPT) != 0) {
+        goto done;
+    }
+    variant_ok = llmopt_variant_fp_samplerate(
+        entry->variant, local_state_bytes, local_data_bytes,
+        local_filter_bytes, coefficients, coefficient_count,
+        scratch_buffer, buffer_count, input, input_count,
+        scratch_output, output_count);
+    host_exceptions = fetestexcept(FE_ALL_EXCEPT);
+    fesetenv(&saved_fenv);
+    if (!variant_ok ||
+        (host_exceptions & (FE_INVALID | FE_DIVBYZERO | FE_OVERFLOW | FE_UNDERFLOW)) ||
+        local_filter->out_gen < 0 || (uint64_t)local_filter->out_gen > output_count ||
+        !fp_double_domain_ok(local_state->last_ratio) ||
+        !fp_double_domain_ok(local_state->last_position) ||
+        !fp_float_domain_ok(scratch_buffer, buffer_count) ||
+        !fp_float_domain_ok(scratch_output, local_filter->out_gen)) {
+        goto done;
+    }
+    committed_output_bytes = local_filter->out_gen * sizeof(float);
+    local_state->private_data = (void *)(uintptr_t)filter_address;
+    local_data->data_in = (const float *)(uintptr_t)input_address;
+    local_data->data_out = (float *)(uintptr_t)output_address;
+    local_filter->coeffs = (const float *)(uintptr_t)coeff_address;
+    local_filter->buffer = (float *)(uintptr_t)buffer_address;
+    memcpy(state, local_state_bytes, sizeof(local_state_bytes));
+    memcpy(data, local_data_bytes, sizeof(local_data_bytes));
+    memcpy(filter, local_filter_bytes, sizeof(local_filter_bytes));
+    memcpy(guest_buffer, scratch_buffer, buffer_bytes);
+    memcpy(guest_output, scratch_output, committed_output_bytes);
+    if (host_exceptions & FE_INEXACT) {
+        vfp_set_fpsr(env, vfp_get_fpsr(env) | (1u << 4));
+    }
+    env->xregs[0] = 0;
+    env->pc = env->xregs[30];
+    success = true;
+
+done:
+    if (input) {
+        unlock_user(input, input_address, 0);
+    }
+    if (coefficients) {
+        unlock_user(coefficients, coeff_address, 0);
+    }
+    if (guest_buffer) {
+        unlock_user(guest_buffer, buffer_address,
+                    success ? buffer_bytes : 0);
+    }
+    if (guest_output) {
+        unlock_user(guest_output, output_address,
+                    success ? committed_output_bytes : 0);
+    }
+    if (filter) {
+        unlock_user(filter, filter_address,
+                    success ? sizeof(local_filter_bytes) : 0);
+    }
+    if (data) {
+        unlock_user(data, data_address,
+                    success ? sizeof(local_data_bytes) : 0);
+    }
+    if (state) {
+        unlock_user(state, state_address,
+                    success ? sizeof(local_state_bytes) : 0);
+    }
+    return success;
+}
+
 static LlmoptDispatchResult guarded_fallback(vaddr pc, const char *reason)
 {
     runtime.guarded_fallbacks++;
@@ -1412,6 +1687,8 @@ LlmoptDispatchResult llmopt_try_dispatch(CPUState *cpu, vaddr pc)
         substituted = substitute_xxh64_stream(env, entry);
     } else if (entry->algorithm == LLMOPT_ALGO_SHA256_STREAM) {
         substituted = substitute_sha256_stream(env, entry);
+    } else if (entry->algorithm == LLMOPT_ALGO_FP_SAMPLERATE) {
+        substituted = substitute_fp_samplerate(env, entry);
     } else {
         substituted = substitute_scalar(env, entry);
     }
