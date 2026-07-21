@@ -970,6 +970,10 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
                 last_tb = NULL;
                 continue;
             }
+            if (llmopt_result == LLMOPT_EXCLUSIVE_REQUEST) {
+                /* The outer linux-user loop acquires after cpu_exec_end(). */
+                return EXCP_INTERRUPT;
+            }
             if (llmopt_result == LLMOPT_GUARDED_FALLBACK) {
                 /* Do not chain the predecessor around a future guard check. */
                 last_tb = NULL;

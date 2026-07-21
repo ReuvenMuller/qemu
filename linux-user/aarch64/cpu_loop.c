@@ -26,6 +26,7 @@
 #include "semihosting/common-semi.h"
 #include "target/arm/syndrome.h"
 #include "target/arm/cpu-features.h"
+#include "exec/llmopt.h"
 
 /* Use the exception syndrome to map a cpu exception to a signal. */
 static void signal_for_exception(CPUARMState *env, vaddr addr)
@@ -164,6 +165,7 @@ void cpu_loop(CPUARMState *env)
         cpu_exec_start(cs);
         trapnr = cpu_exec(cs);
         cpu_exec_end(cs);
+        llmopt_run_pending_exclusive(cs);
         qemu_process_cpu_events(cs);
 
         switch (trapnr) {
