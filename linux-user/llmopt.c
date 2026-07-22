@@ -177,6 +177,7 @@ typedef struct LlmoptRuntime {
     uint64_t stable_direct_hits;
     uint64_t portable_variant_hits;
     uint64_t optimized_variant_hits;
+    uint64_t bulk_variant_hits;
     uint64_t code_verifications;
     uint64_t code_verification_failures;
     uint64_t page_version_checks;
@@ -411,7 +412,8 @@ static bool parse_entry_line(const char *line, LlmoptEntry *entry, bool v3)
         strlen(fields[0]) >= sizeof(entry->catalog_id) ||
         strlen(fields[1]) != 36 || strlen(fields[5]) == 0 ||
         (strcmp(fields[5], "portable_c") != 0 &&
-         strcmp(fields[5], "x86_64_optimized") != 0) ||
+         strcmp(fields[5], "x86_64_optimized") != 0 &&
+         strcmp(fields[5], "bulk_c") != 0) ||
         !parse_u64(fields[2], 16, &pc) || !pc ||
         !parse_u64(fields[3], 10, &code_size) || !code_size ||
         code_size > LLMOPT_MAX_MAP_BYTES ||
@@ -473,8 +475,15 @@ static bool parse_entry_line(const char *line, LlmoptEntry *entry, bool v3)
         (entry->fp_samplerate && !entry->stable_direct)) {
         return false;
     }
-    entry->variant = strcmp(fields[5], "portable_c") == 0 ?
-        LLMOPT_VARIANT_PORTABLE_C : LLMOPT_VARIANT_X86_64_OPTIMIZED;
+    if (strcmp(fields[5], "portable_c") == 0) {
+        entry->variant = LLMOPT_VARIANT_PORTABLE_C;
+    } else if (strcmp(fields[5], "x86_64_optimized") == 0) {
+        entry->variant = LLMOPT_VARIANT_X86_64_OPTIMIZED;
+    } else if (strcmp(fields[5], "bulk_c") == 0) {
+        entry->variant = LLMOPT_VARIANT_BULK_C;
+    } else {
+        return false;
+    }
     if (!llmopt_variant_available(entry->variant,
                                   variant_algorithm(entry->algorithm))) {
         return false;
@@ -562,6 +571,7 @@ void llmopt_report(void)
             " stable_direct_hits=%" PRIu64
             " portable_variant_hits=%" PRIu64
             " optimized_variant_hits=%" PRIu64
+            " bulk_variant_hits=%" PRIu64
             " code_verifications=%" PRIu64
             " code_verification_failures=%" PRIu64
             " page_version_checks=%" PRIu64
@@ -606,7 +616,8 @@ void llmopt_report(void)
             runtime.substitution_region_count, runtime.substitution_region_ns,
             runtime.sequence_region_count, runtime.sequence_region_ns,
             runtime.stable_direct_hits, runtime.portable_variant_hits,
-            runtime.optimized_variant_hits, runtime.code_verifications,
+            runtime.optimized_variant_hits, runtime.bulk_variant_hits,
+            runtime.code_verifications,
             runtime.code_verification_failures, runtime.page_version_checks,
             runtime.page_version_mismatches, runtime.page_change_fallbacks,
             runtime.late_page_version_rejects, runtime.forced_code_changes,
@@ -1937,6 +1948,8 @@ LlmoptDispatchResult llmopt_try_dispatch(CPUState *cpu, vaddr pc)
     runtime.hits++;
     if (entry->variant == LLMOPT_VARIANT_PORTABLE_C) {
         runtime.portable_variant_hits++;
+    } else if (entry->variant == LLMOPT_VARIANT_BULK_C) {
+        runtime.bulk_variant_hits++;
     } else {
         runtime.optimized_variant_hits++;
     }
@@ -1949,7 +1962,9 @@ LlmoptDispatchResult llmopt_try_dispatch(CPUState *cpu, vaddr pc)
                 " variant=%s guard_checked=1 hit=%" PRIu64 "\n",
                 (uint64_t)pc, entry->catalog_id, entry->verdict_id,
                 entry->variant == LLMOPT_VARIANT_PORTABLE_C ?
-                    "portable_c" : "x86_64_optimized",
+                    "portable_c" :
+                entry->variant == LLMOPT_VARIANT_BULK_C ?
+                    "bulk_c" : "x86_64_optimized",
                 runtime.hits);
     }
     return LLMOPT_SUBSTITUTED;
@@ -2123,6 +2138,8 @@ LlmoptDispatchResult llmopt_run_pending_exclusive(CPUState *cpu)
     runtime.hits++;
     if (entry->variant == LLMOPT_VARIANT_PORTABLE_C) {
         runtime.portable_variant_hits++;
+    } else if (entry->variant == LLMOPT_VARIANT_BULK_C) {
+        runtime.bulk_variant_hits++;
     } else {
         runtime.optimized_variant_hits++;
     }

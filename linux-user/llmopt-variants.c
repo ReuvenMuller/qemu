@@ -9,6 +9,12 @@
 
 #include "llmopt-variants.h"
 
+#ifndef STREAM_MUTANT
+#define STREAM_MUTANT 0
+#endif
+
+#include "llmopt-xxh64-bulk.h"
+
 #include <math.h>
 
 static inline uint32_t rotl32(uint32_t value, unsigned count)
@@ -316,7 +322,13 @@ bool llmopt_variant_available(LlmoptHostVariant variant,
     if (variant == LLMOPT_VARIANT_PORTABLE_C) {
         return true;
     }
+    if (variant == LLMOPT_VARIANT_BULK_C) {
+        return algorithm == LLMOPT_VARIANT_ALGO_XXH64_STREAM;
+    }
 #if defined(__x86_64__)
+    if (variant != LLMOPT_VARIANT_X86_64_OPTIMIZED) {
+        return false;
+    }
     __builtin_cpu_init();
     if (algorithm == LLMOPT_VARIANT_ALGO_SHA256) {
         return __builtin_cpu_supports("ssse3");
@@ -618,6 +630,10 @@ bool llmopt_variant_xxh64_stream(unsigned variant, uint8_t state[88],
     if (!state || !llmopt_variant_available(
             variant, LLMOPT_VARIANT_ALGO_XXH64_STREAM)) {
         return false;
+    }
+    if (variant == LLMOPT_VARIANT_BULK_C) {
+        return llmopt_xxh64_stream_update_bulk_impl(
+            (LlmoptXxh64BulkState *)state, input, length);
     }
     return xxh64_stream_update((LlmoptXxh64StreamingState *)state,
                                input, length);

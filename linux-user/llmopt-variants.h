@@ -8,6 +8,7 @@
 typedef enum LlmoptHostVariant {
     LLMOPT_VARIANT_PORTABLE_C = 0,
     LLMOPT_VARIANT_X86_64_OPTIMIZED = 1,
+    LLMOPT_VARIANT_BULK_C = 2,
 } LlmoptHostVariant;
 
 typedef enum LlmoptVariantAlgorithm {
