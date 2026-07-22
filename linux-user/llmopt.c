@@ -89,8 +89,14 @@ typedef struct LlmoptIdentityJob {
     char expected_guest_sha256[65];
     char *runtime_binary;
     char expected_runtime_sha256[65];
-    bool verify_runtime;
+    bool runtime_job;
+    bool test_failure;
+    bool test_unknown;
+    bool test_unreadable;
     uint64_t test_delay_ms;
+    uint64_t hash_start_ns;
+    uint64_t hash_end_ns;
+    int hash_result;
     int state;
     int cancel_requested;
 } LlmoptIdentityJob;
@@ -133,6 +139,7 @@ typedef struct LlmoptRuntime {
     bool reported;
     bool debugger_active;
     bool baseline_only;
+    bool synchronous_runtime_identity;
     bool force_guard_fail_once;
     bool forced_guard_fired;
     bool force_code_change_once;
@@ -142,9 +149,13 @@ typedef struct LlmoptRuntime {
     bool forced_code_change_fired;
     bool forced_code_restore_pending;
     LlmoptIdentityJob identity_job;
+    LlmoptIdentityJob runtime_identity_job;
     bool identity_thread_started;
     bool identity_thread_joined;
     bool identity_result_accounted;
+    bool runtime_identity_thread_started;
+    bool runtime_identity_thread_joined;
+    bool runtime_identity_result_accounted;
     bool identity_activation_observed;
     bool baseline_region_active;
     bool sequence_region_active;
@@ -194,9 +205,17 @@ typedef struct LlmoptRuntime {
     uint64_t identity_pending_fallbacks;
     uint64_t identity_mismatch_fallbacks;
     uint64_t identity_activation_observations;
+    uint64_t identity_state_observations;
+    uint64_t both_pending_observations;
+    uint64_t runtime_matched_guest_pending_observations;
+    uint64_t guest_matched_runtime_pending_observations;
+    uint64_t both_matched_observations;
+    uint64_t runtime_terminal_observations;
+    uint64_t guest_terminal_observations;
     uint64_t runtime_identity_checks;
     uint64_t runtime_identity_failures;
     uint64_t runtime_identity_matches;
+    uint64_t runtime_identity_cancellations;
     uint64_t single_cpu_guard_rejects;
     uint64_t invocation_mode_refusals;
     uint64_t caller_pc_rejects;
@@ -212,6 +231,22 @@ typedef struct LlmoptRuntime {
     uint64_t exclusive_hold_ns;
     uint64_t exclusive_max_wait_ns;
     uint64_t exclusive_max_hold_ns;
+    uint64_t initialize_start_ns;
+    uint64_t map_parse_start_ns;
+    uint64_t map_parse_end_ns;
+    uint64_t runtime_hash_start_ns;
+    uint64_t runtime_hash_end_ns;
+    int runtime_hash_result;
+    uint64_t guest_release_ns;
+    uint64_t runtime_release_ns;
+    uint64_t identity_ready_ns;
+    uint64_t first_dispatch_ns;
+    uint64_t first_eligible_hit_ns;
+    uint64_t cleanup_start_ns;
+    uint64_t cleanup_end_ns;
+    uint64_t cleanup_join_ns;
+    uint64_t guest_cleanup_join_ns;
+    uint64_t runtime_cleanup_join_ns;
 } LlmoptRuntime;
 
 static LlmoptRuntime runtime;
@@ -312,18 +347,32 @@ static LlmoptIdentityState file_identity(LlmoptIdentityJob *job,
         LLMOPT_IDENTITY_MATCHED : LLMOPT_IDENTITY_MISMATCHED;
 }
 
-static void *guest_identity_worker(void *opaque)
+static void complete_identity_job(LlmoptIdentityJob *job)
 {
-    LlmoptIdentityJob *job = opaque;
-    LlmoptIdentityState result = file_identity(
-        job, job->guest_binary, job->expected_guest_sha256);
+    LlmoptIdentityState result;
+    const char *path = job->runtime_job ? job->runtime_binary :
+                                         job->guest_binary;
+    const char *expected = job->runtime_job ?
+        job->expected_runtime_sha256 : job->expected_guest_sha256;
 
-    if (result == LLMOPT_IDENTITY_MATCHED && job->verify_runtime) {
-        result = file_identity(job, job->runtime_binary,
-                               job->expected_runtime_sha256);
+    job->hash_start_ns = now_ns();
+    if (job->test_failure) {
+        result = LLMOPT_IDENTITY_MISMATCHED;
+    } else if (job->test_unknown) {
+        result = 99;
+    } else {
+        result = file_identity(job, job->test_unreadable ? NULL : path,
+                               expected);
     }
 
+    job->hash_end_ns = now_ns();
+    job->hash_result = result;
     qatomic_store_release(&job->state, result);
+}
+
+static void *identity_worker(void *opaque)
+{
+    complete_identity_job(opaque);
     return NULL;
 }
 
@@ -500,61 +549,127 @@ static bool parse_entry_line(const char *line, LlmoptEntry *entry, bool v3)
     return true;
 }
 
-static LlmoptIdentityState identity_state_acquire(void)
+static LlmoptIdentityState guest_identity_state_acquire(void)
 {
     return qatomic_load_acquire(&runtime.identity_job.state);
 }
 
-static void identity_account_result(void)
+static LlmoptIdentityState runtime_identity_state_acquire(void)
 {
-    LlmoptIdentityState state;
+    return qatomic_load_acquire(&runtime.runtime_identity_job.state);
+}
 
-    if (!runtime.identity_thread_started || runtime.identity_result_accounted) {
-        return;
+static LlmoptIdentityState combined_identity_state(
+    LlmoptIdentityState runtime_state, LlmoptIdentityState guest_state)
+{
+    if ((runtime_state != LLMOPT_IDENTITY_PENDING &&
+         runtime_state != LLMOPT_IDENTITY_MATCHED) ||
+        (guest_state != LLMOPT_IDENTITY_PENDING &&
+         guest_state != LLMOPT_IDENTITY_MATCHED)) {
+        return LLMOPT_IDENTITY_MISMATCHED;
     }
-    state = identity_state_acquire();
-    if (state == LLMOPT_IDENTITY_PENDING) {
-        return;
+    if (runtime_state == LLMOPT_IDENTITY_MATCHED &&
+        guest_state == LLMOPT_IDENTITY_MATCHED) {
+        return LLMOPT_IDENTITY_MATCHED;
     }
-    runtime.identity_result_accounted = true;
-    if (state == LLMOPT_IDENTITY_MATCHED) {
-        runtime.guest_identity_matches++;
-        if (runtime.identity_job.verify_runtime) {
-            runtime.runtime_identity_matches++;
+    return LLMOPT_IDENTITY_PENDING;
+}
+
+static LlmoptIdentityState identity_state_acquire(void)
+{
+    return combined_identity_state(runtime_identity_state_acquire(),
+                                   guest_identity_state_acquire());
+}
+
+static void identity_account_results(void)
+{
+    LlmoptIdentityState guest_state = guest_identity_state_acquire();
+    LlmoptIdentityState runtime_state = runtime_identity_state_acquire();
+
+    if (runtime.guest_identity_checks &&
+        !runtime.identity_result_accounted &&
+        guest_state != LLMOPT_IDENTITY_PENDING) {
+        runtime.identity_result_accounted = true;
+        if (guest_state == LLMOPT_IDENTITY_MATCHED) {
+            runtime.guest_identity_matches++;
+        } else if (guest_state == LLMOPT_IDENTITY_CANCELLED) {
+            runtime.guest_identity_cancellations++;
+        } else {
+            runtime.guest_identity_failures++;
         }
-    } else if (state == LLMOPT_IDENTITY_MISMATCHED) {
-        runtime.guest_identity_failures++;
-        if (runtime.identity_job.verify_runtime) {
+    }
+    if (runtime.runtime_identity_checks &&
+        !runtime.runtime_identity_result_accounted &&
+        runtime_state != LLMOPT_IDENTITY_PENDING) {
+        runtime.runtime_identity_result_accounted = true;
+        if (runtime_state == LLMOPT_IDENTITY_MATCHED) {
+            runtime.runtime_identity_matches++;
+        } else if (runtime_state == LLMOPT_IDENTITY_CANCELLED) {
+            runtime.runtime_identity_cancellations++;
+        } else {
             runtime.runtime_identity_failures++;
         }
-    } else if (state == LLMOPT_IDENTITY_CANCELLED) {
-        runtime.guest_identity_cancellations++;
     }
+}
+
+static uint64_t measured_duration_ns(uint64_t start, uint64_t end)
+{
+    return start && end >= start ? end - start : 0;
 }
 
 void llmopt_cleanup(void)
 {
-    if (!runtime.identity_thread_started || runtime.identity_thread_joined) {
-        return;
-    }
-    if (identity_state_acquire() == LLMOPT_IDENTITY_PENDING) {
+    uint64_t join_start;
+
+    runtime.cleanup_start_ns = now_ns();
+    if (runtime.identity_thread_started && !runtime.identity_thread_joined &&
+        guest_identity_state_acquire() == LLMOPT_IDENTITY_PENDING) {
         qatomic_store_release(&runtime.identity_job.cancel_requested, true);
     }
-    qemu_thread_join(&runtime.identity_job.thread);
-    runtime.identity_thread_joined = true;
-    identity_account_result();
+    if (runtime.runtime_identity_thread_started &&
+        !runtime.runtime_identity_thread_joined &&
+        runtime_identity_state_acquire() == LLMOPT_IDENTITY_PENDING) {
+        qatomic_store_release(
+            &runtime.runtime_identity_job.cancel_requested, true);
+    }
+    if (runtime.identity_thread_started && !runtime.identity_thread_joined) {
+        join_start = now_ns();
+        qemu_thread_join(&runtime.identity_job.thread);
+        runtime.guest_cleanup_join_ns = now_ns() - join_start;
+        runtime.identity_thread_joined = true;
+    }
+    if (runtime.runtime_identity_thread_started &&
+        !runtime.runtime_identity_thread_joined) {
+        join_start = now_ns();
+        qemu_thread_join(&runtime.runtime_identity_job.thread);
+        runtime.runtime_cleanup_join_ns = now_ns() - join_start;
+        runtime.runtime_identity_thread_joined = true;
+    }
+    runtime.cleanup_join_ns = now_ns();
+    identity_account_results();
     g_clear_pointer(&runtime.identity_job.guest_binary, g_free);
     g_clear_pointer(&runtime.identity_job.runtime_binary, g_free);
+    g_clear_pointer(&runtime.runtime_identity_job.guest_binary, g_free);
+    g_clear_pointer(&runtime.runtime_identity_job.runtime_binary, g_free);
+    runtime.cleanup_end_ns = now_ns();
 }
 
 void llmopt_report(void)
 {
-    identity_account_result();
-    if ((!runtime.enabled && runtime.guest_identity_failures == 0) ||
-        !runtime.report_enabled || runtime.reported) {
+    identity_account_results();
+    if (!runtime.report_enabled || runtime.reported) {
         return;
     }
     runtime.reported = true;
+    if (!runtime.synchronous_runtime_identity &&
+        runtime.runtime_identity_thread_started) {
+        runtime.runtime_hash_start_ns =
+            runtime.runtime_identity_job.hash_start_ns;
+        runtime.runtime_hash_end_ns = runtime.runtime_identity_job.hash_end_ns;
+        runtime.runtime_hash_result = runtime.runtime_identity_job.hash_result;
+    }
+    runtime.identity_ready_ns = MAX(runtime.identity_job.hash_end_ns,
+                                    runtime.runtime_hash_end_ns);
     fprintf(stderr,
             "LLMOPT_REPORT entries=%zu attempts=%" PRIu64
             " guard_checks=%" PRIu64 " hits=%" PRIu64
@@ -588,9 +703,17 @@ void llmopt_report(void)
             " identity_pending_fallbacks=%" PRIu64
             " identity_mismatch_fallbacks=%" PRIu64
             " identity_activation_observations=%" PRIu64
+            " identity_state_observations=%" PRIu64
+            " both_pending_observations=%" PRIu64
+            " runtime_matched_guest_pending_observations=%" PRIu64
+            " guest_matched_runtime_pending_observations=%" PRIu64
+            " both_matched_observations=%" PRIu64
+            " runtime_terminal_observations=%" PRIu64
+            " guest_terminal_observations=%" PRIu64
             " runtime_identity_checks=%" PRIu64
             " runtime_identity_failures=%" PRIu64
             " runtime_identity_matches=%" PRIu64
+            " runtime_identity_cancellations=%" PRIu64
             " single_cpu_guard_rejects=%" PRIu64
             " invocation_mode_refusals=%" PRIu64
             " caller_pc_rejects=%" PRIu64
@@ -606,7 +729,8 @@ void llmopt_report(void)
             " exclusive_hold_ns=%" PRIu64
             " exclusive_max_wait_ns=%" PRIu64
             " exclusive_max_hold_ns=%" PRIu64
-            " identity_state=%d\n",
+            " identity_state=%d guest_identity_state=%d"
+            " runtime_identity_state=%d identity_mode=%d\n",
             runtime.entry_count, runtime.attempts, runtime.guard_checks,
             runtime.hits, runtime.guarded_fallbacks,
             runtime.rechecks_after_fallback, runtime.code_rejects,
@@ -629,9 +753,17 @@ void llmopt_report(void)
             runtime.identity_pending_fallbacks,
             runtime.identity_mismatch_fallbacks,
             runtime.identity_activation_observations,
+            runtime.identity_state_observations,
+            runtime.both_pending_observations,
+            runtime.runtime_matched_guest_pending_observations,
+            runtime.guest_matched_runtime_pending_observations,
+            runtime.both_matched_observations,
+            runtime.runtime_terminal_observations,
+            runtime.guest_terminal_observations,
             runtime.runtime_identity_checks,
             runtime.runtime_identity_failures,
             runtime.runtime_identity_matches,
+            runtime.runtime_identity_cancellations,
             runtime.single_cpu_guard_rejects,
             runtime.invocation_mode_refusals,
             runtime.caller_pc_rejects,
@@ -646,8 +778,55 @@ void llmopt_report(void)
             runtime.exclusive_wait_ns,
             runtime.exclusive_hold_ns,
             runtime.exclusive_max_wait_ns,
-            runtime.exclusive_max_hold_ns,
-            runtime.identity_thread_started ? identity_state_acquire() : -1);
+            runtime.exclusive_max_hold_ns, identity_state_acquire(),
+            guest_identity_state_acquire(), runtime_identity_state_acquire(),
+            runtime.synchronous_runtime_identity ? 0 : 1);
+    fprintf(stderr,
+            "LLMOPT_TIMELINE initialize_start_ns=%" PRIu64
+            " map_parse_start_ns=%" PRIu64
+            " map_parse_end_ns=%" PRIu64
+            " map_parse_duration_ns=%" PRIu64
+            " runtime_hash_start_ns=%" PRIu64
+            " runtime_hash_end_ns=%" PRIu64
+            " runtime_hash_duration_ns=%" PRIu64
+            " runtime_hash_result=%d"
+            " guest_hash_start_ns=%" PRIu64
+            " guest_hash_end_ns=%" PRIu64
+            " guest_hash_duration_ns=%" PRIu64
+            " guest_hash_result=%d"
+            " guest_release_ns=%" PRIu64
+            " runtime_release_ns=%" PRIu64
+            " identity_ready_ns=%" PRIu64
+            " first_dispatch_ns=%" PRIu64
+            " first_eligible_hit_ns=%" PRIu64
+            " cleanup_start_ns=%" PRIu64
+            " cleanup_join_ns=%" PRIu64
+            " cleanup_end_ns=%" PRIu64
+            " guest_cleanup_join_ns=%" PRIu64
+            " runtime_cleanup_join_ns=%" PRIu64
+            " leaked_worker_count=%u\n",
+            runtime.initialize_start_ns,
+            runtime.map_parse_start_ns, runtime.map_parse_end_ns,
+            measured_duration_ns(runtime.map_parse_start_ns,
+                                 runtime.map_parse_end_ns),
+            runtime.runtime_hash_start_ns, runtime.runtime_hash_end_ns,
+            measured_duration_ns(runtime.runtime_hash_start_ns,
+                                 runtime.runtime_hash_end_ns),
+            runtime.runtime_hash_result,
+            runtime.identity_job.hash_start_ns,
+            runtime.identity_job.hash_end_ns,
+            measured_duration_ns(runtime.identity_job.hash_start_ns,
+                                 runtime.identity_job.hash_end_ns),
+            runtime.identity_job.hash_result, runtime.guest_release_ns,
+            runtime.runtime_release_ns,
+            runtime.identity_ready_ns, runtime.first_dispatch_ns,
+            runtime.first_eligible_hit_ns, runtime.cleanup_start_ns,
+            runtime.cleanup_join_ns, runtime.cleanup_end_ns,
+            runtime.guest_cleanup_join_ns, runtime.runtime_cleanup_join_ns,
+            (runtime.identity_thread_started &&
+             !runtime.identity_thread_joined) +
+            (runtime.runtime_identity_thread_started &&
+             !runtime.runtime_identity_thread_joined));
 }
 
 static void disable_map(const char *reason)
@@ -662,6 +841,9 @@ void llmopt_initialize(bool debugger_active, const char *guest_binary,
 {
     const char *path = getenv("QEMU_LLMOPT_MAP");
     const char *test_delay = getenv("QEMU_LLMOPT_TEST_HASH_DELAY_MS");
+    const char *runtime_test_delay =
+        getenv("QEMU_LLMOPT_TEST_RUNTIME_HASH_DELAY_MS");
+    const char *identity_mode = getenv("QEMU_LLMOPT_IDENTITY_MODE");
     const char *test_hold = getenv("QEMU_LLMOPT_TEST_EXCLUSIVE_HOLD_MS");
     const char *test_unprotected =
         getenv("QEMU_LLMOPT_TEST_UNPROTECTED_PROBE_MS");
@@ -671,12 +853,15 @@ void llmopt_initialize(bool debugger_active, const char *guest_binary,
     gsize length = 0;
     uint64_t declared_count;
     uint64_t test_delay_ms = 0;
+    uint64_t runtime_test_delay_ms = 0;
     uint8_t guest_sha256[32];
     uint8_t runtime_sha256[32];
     bool v3;
     size_t header_lines;
     LlmoptEntry parsed[LLMOPT_MAX_ENTRIES] = { 0 };
 
+    runtime.initialize_start_ns = now_ns();
+    runtime.map_parse_start_ns = runtime.initialize_start_ns;
     if (runtime.initialized) {
         return;
     }
@@ -696,9 +881,22 @@ void llmopt_initialize(bool debugger_active, const char *guest_binary,
     if (g_strcmp0(getenv("QEMU_LLMOPT"), "1") != 0) {
         return;
     }
-    if (test_delay &&
-        (!parse_u64(test_delay, 10, &test_delay_ms) ||
-         test_delay_ms > 60000)) {
+    atexit(llmopt_report);
+    atexit(llmopt_cleanup);
+    if (!identity_mode || strcmp(identity_mode, "async") == 0) {
+        runtime.synchronous_runtime_identity = false;
+    } else if (strcmp(identity_mode, "sync") == 0) {
+        runtime.synchronous_runtime_identity = true;
+    } else {
+        disable_map("unknown runtime-identity scheduling mode");
+        return;
+    }
+    if ((test_delay &&
+         (!parse_u64(test_delay, 10, &test_delay_ms) ||
+          test_delay_ms > 60000)) ||
+        (runtime_test_delay &&
+         (!parse_u64(runtime_test_delay, 10, &runtime_test_delay_ms) ||
+          runtime_test_delay_ms > 60000))) {
         disable_map("invalid background-hash test delay");
         return;
     }
@@ -775,48 +973,83 @@ void llmopt_initialize(bool debugger_active, const char *guest_binary,
         return;
     }
     memcpy(runtime.entries, parsed, declared_count * sizeof(parsed[0]));
+    runtime.map_parse_end_ns = now_ns();
     runtime.identity_job.guest_binary =
         g_steal_pointer(&guest_binary_copy);
+    qatomic_set(&runtime.identity_job.state, LLMOPT_IDENTITY_PENDING);
+    qatomic_set(&runtime.identity_job.cancel_requested, false);
+    qatomic_set(&runtime.runtime_identity_job.state,
+                v3 ? LLMOPT_IDENTITY_PENDING : LLMOPT_IDENTITY_MATCHED);
+    qatomic_set(&runtime.runtime_identity_job.cancel_requested, false);
     if (v3) {
-        runtime.identity_job.runtime_binary = g_strdup("/proc/self/exe");
-        if (!runtime.identity_job.runtime_binary) {
+        runtime.runtime_identity_job.runtime_binary = g_strdup("/proc/self/exe");
+        if (!runtime.runtime_identity_job.runtime_binary) {
             disable_map("runtime binary path unavailable");
             return;
         }
-        g_strlcpy(runtime.identity_job.expected_runtime_sha256,
+        g_strlcpy(runtime.runtime_identity_job.expected_runtime_sha256,
                   lines[3] + strlen("qemu_runtime_sha256\t"),
-                  sizeof(runtime.identity_job.expected_runtime_sha256));
-        runtime.identity_job.verify_runtime = true;
+                  sizeof(runtime.runtime_identity_job.expected_runtime_sha256));
+        runtime.runtime_identity_job.runtime_job = true;
+        runtime.runtime_identity_job.test_delay_ms = runtime_test_delay_ms;
+        runtime.runtime_identity_job.test_failure = g_strcmp0(
+            getenv("QEMU_LLMOPT_TEST_RUNTIME_WORKER_FAILURE"), "1") == 0;
+        runtime.runtime_identity_job.test_unknown = g_strcmp0(
+            getenv("QEMU_LLMOPT_TEST_RUNTIME_UNKNOWN_STATE"), "1") == 0;
+        runtime.runtime_identity_job.test_unreadable = g_strcmp0(
+            getenv("QEMU_LLMOPT_TEST_RUNTIME_UNREADABLE"), "1") == 0;
         runtime.runtime_identity_checks++;
-        if (file_identity(&runtime.identity_job,
-                          runtime.identity_job.runtime_binary,
-                          runtime.identity_job.expected_runtime_sha256) !=
-            LLMOPT_IDENTITY_MATCHED) {
-            runtime.runtime_identity_failures++;
-            g_clear_pointer(&runtime.identity_job.guest_binary, g_free);
-            g_clear_pointer(&runtime.identity_job.runtime_binary, g_free);
-            disable_map("runtime QEMU identity rejected");
-            return;
+        if (runtime.synchronous_runtime_identity) {
+            runtime.runtime_hash_start_ns = now_ns();
+            runtime.runtime_hash_result = file_identity(
+                &runtime.runtime_identity_job,
+                runtime.runtime_identity_job.runtime_binary,
+                runtime.runtime_identity_job.expected_runtime_sha256);
+            runtime.runtime_hash_end_ns = now_ns();
+            runtime.runtime_identity_job.hash_start_ns =
+                runtime.runtime_hash_start_ns;
+            runtime.runtime_identity_job.hash_end_ns =
+                runtime.runtime_hash_end_ns;
+            runtime.runtime_identity_job.hash_result =
+                runtime.runtime_hash_result;
+            qatomic_store_release(&runtime.runtime_identity_job.state,
+                                  runtime.runtime_hash_result);
+            runtime.runtime_identity_result_accounted = true;
+            if (runtime.runtime_hash_result != LLMOPT_IDENTITY_MATCHED) {
+                runtime.runtime_identity_failures++;
+                disable_map("runtime QEMU identity rejected");
+                return;
+            }
+            runtime.runtime_identity_matches++;
         }
-        runtime.runtime_identity_matches++;
-        /* The background job now needs only the exact guest identity. */
-        runtime.identity_job.verify_runtime = false;
     }
     g_strlcpy(runtime.identity_job.expected_guest_sha256,
               lines[1] + strlen("guest_sha256\t"),
               sizeof(runtime.identity_job.expected_guest_sha256));
     runtime.identity_job.test_delay_ms = test_delay_ms;
-    qatomic_set(&runtime.identity_job.state, LLMOPT_IDENTITY_PENDING);
-    qatomic_set(&runtime.identity_job.cancel_requested, false);
+    runtime.identity_job.test_failure = g_strcmp0(
+        getenv("QEMU_LLMOPT_TEST_GUEST_WORKER_FAILURE"), "1") == 0;
+    runtime.identity_job.test_unknown = g_strcmp0(
+        getenv("QEMU_LLMOPT_TEST_GUEST_UNKNOWN_STATE"), "1") == 0;
+    runtime.identity_job.test_unreadable = g_strcmp0(
+        getenv("QEMU_LLMOPT_TEST_GUEST_UNREADABLE"), "1") == 0;
     runtime.entry_count = declared_count;
     runtime.enabled = true;
-    atexit(llmopt_report);
-    atexit(llmopt_cleanup);
+    runtime.guest_identity_checks++;
     qemu_thread_create(&runtime.identity_job.thread, "llmopt-identity",
-                       guest_identity_worker, &runtime.identity_job,
+                       identity_worker, &runtime.identity_job,
                        QEMU_THREAD_JOINABLE);
     runtime.identity_thread_started = true;
-    runtime.guest_identity_checks++;
+    runtime.guest_release_ns = now_ns();
+    if (v3 && !runtime.synchronous_runtime_identity) {
+        qemu_thread_create(&runtime.runtime_identity_job.thread,
+                           "llmopt-runtime-identity",
+                           identity_worker,
+                           &runtime.runtime_identity_job,
+                           QEMU_THREAD_JOINABLE);
+        runtime.runtime_identity_thread_started = true;
+        runtime.runtime_release_ns = now_ns();
+    }
     if (runtime.trace) {
         fprintf(stderr,
                 "LLMOPT_MAP_READY entries=%zu immutable=1 identity=pending\n",
@@ -955,10 +1188,36 @@ static bool entry_bytes_reverify(LlmoptEntry *entry)
 
 static LlmoptIdentityState guest_identity_activation_state(void)
 {
-    LlmoptIdentityState state = identity_state_acquire();
+    LlmoptIdentityState runtime_state = runtime_identity_state_acquire();
+    LlmoptIdentityState guest_state = guest_identity_state_acquire();
+    LlmoptIdentityState state = combined_identity_state(runtime_state,
+                                                        guest_state);
 
+    runtime.identity_state_observations++;
+    if (runtime_state == LLMOPT_IDENTITY_PENDING &&
+        guest_state == LLMOPT_IDENTITY_PENDING) {
+        runtime.both_pending_observations++;
+    } else if (runtime_state == LLMOPT_IDENTITY_MATCHED &&
+               guest_state == LLMOPT_IDENTITY_PENDING) {
+        runtime.runtime_matched_guest_pending_observations++;
+    } else if (runtime_state == LLMOPT_IDENTITY_PENDING &&
+               guest_state == LLMOPT_IDENTITY_MATCHED) {
+        runtime.guest_matched_runtime_pending_observations++;
+    } else if (runtime_state == LLMOPT_IDENTITY_MATCHED &&
+               guest_state == LLMOPT_IDENTITY_MATCHED) {
+        runtime.both_matched_observations++;
+    } else {
+        if (runtime_state != LLMOPT_IDENTITY_PENDING &&
+            runtime_state != LLMOPT_IDENTITY_MATCHED) {
+            runtime.runtime_terminal_observations++;
+        }
+        if (guest_state != LLMOPT_IDENTITY_PENDING &&
+            guest_state != LLMOPT_IDENTITY_MATCHED) {
+            runtime.guest_terminal_observations++;
+        }
+    }
     if (state != LLMOPT_IDENTITY_PENDING) {
-        identity_account_result();
+        identity_account_results();
     }
     if (state == LLMOPT_IDENTITY_MATCHED &&
         !runtime.identity_activation_observed) {
@@ -1758,6 +2017,9 @@ LlmoptDispatchResult llmopt_try_dispatch(CPUState *cpu, vaddr pc)
     if (!entry) {
         return LLMOPT_NOT_APPLICABLE;
     }
+    if (!runtime.first_dispatch_ns) {
+        runtime.first_dispatch_ns = now_ns();
+    }
     /* A repeated block entry proves that the preceding call returned. */
     if (runtime.baseline_region_active) {
         runtime.baseline_region_ns += now_ns() - runtime.baseline_start_ns;
@@ -1778,15 +2040,15 @@ LlmoptDispatchResult llmopt_try_dispatch(CPUState *cpu, vaddr pc)
     if (identity_state == LLMOPT_IDENTITY_PENDING) {
         runtime.identity_pending_fallbacks++;
         begin_baseline_region(env, entry_start);
-        return guarded_fallback(pc, "guest_binary_identity_pending");
+        return guarded_fallback(pc, "runtime_or_guest_identity_pending");
     }
     if (identity_state != LLMOPT_IDENTITY_MATCHED) {
         LlmoptDispatchResult result =
-            guarded_fallback(pc, "guest_binary_identity_mismatch");
+            guarded_fallback(pc, "runtime_or_guest_identity_mismatch");
 
         runtime.identity_mismatch_fallbacks++;
         begin_baseline_region(env, entry_start);
-        disable_map("guest binary identity rejected by background hash");
+        disable_map("runtime or guest identity rejected by background hash");
         return result;
     }
     if (runtime.pending_recheck && runtime.fallback_pc == pc) {
@@ -1946,6 +2208,9 @@ LlmoptDispatchResult llmopt_try_dispatch(CPUState *cpu, vaddr pc)
         return guarded_fallback(pc, "internal_guard_audit");
     }
     runtime.hits++;
+    if (!runtime.first_eligible_hit_ns) {
+        runtime.first_eligible_hit_ns = now_ns();
+    }
     if (entry->variant == LLMOPT_VARIANT_PORTABLE_C) {
         runtime.portable_variant_hits++;
     } else if (entry->variant == LLMOPT_VARIANT_BULK_C) {
@@ -2136,6 +2401,9 @@ LlmoptDispatchResult llmopt_run_pending_exclusive(CPUState *cpu)
         runtime.sequence_start_ns = start_ns;
     }
     runtime.hits++;
+    if (!runtime.first_eligible_hit_ns) {
+        runtime.first_eligible_hit_ns = now_ns();
+    }
     if (entry->variant == LLMOPT_VARIANT_PORTABLE_C) {
         runtime.portable_variant_hits++;
     } else if (entry->variant == LLMOPT_VARIANT_BULK_C) {
