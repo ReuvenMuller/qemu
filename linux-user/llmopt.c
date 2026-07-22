@@ -96,6 +96,8 @@ typedef struct LlmoptIdentityJob {
     uint64_t test_delay_ms;
     uint64_t hash_start_ns;
     uint64_t hash_end_ns;
+    uint64_t hash_cpu_start_ns;
+    uint64_t hash_cpu_end_ns;
     int hash_result;
     int state;
     int cancel_requested;
@@ -254,6 +256,7 @@ static __thread LlmoptEntry *exclusive_pending_entry;
 static __thread uint64_t exclusive_pending_start_ns;
 
 static uint64_t now_ns(void);
+static uint64_t thread_cpu_ns(void);
 static bool another_guest_cpu_running(CPUState *cpu);
 
 static bool observe_other_cpu_running(CPUState *cpu, uint64_t duration_ms)
@@ -356,6 +359,7 @@ static void complete_identity_job(LlmoptIdentityJob *job)
         job->expected_runtime_sha256 : job->expected_guest_sha256;
 
     job->hash_start_ns = now_ns();
+    job->hash_cpu_start_ns = thread_cpu_ns();
     if (job->test_failure) {
         result = LLMOPT_IDENTITY_MISMATCHED;
     } else if (job->test_unknown) {
@@ -366,6 +370,7 @@ static void complete_identity_job(LlmoptIdentityJob *job)
     }
 
     job->hash_end_ns = now_ns();
+    job->hash_cpu_end_ns = thread_cpu_ns();
     job->hash_result = result;
     qatomic_store_release(&job->state, result);
 }
@@ -789,10 +794,12 @@ void llmopt_report(void)
             " runtime_hash_start_ns=%" PRIu64
             " runtime_hash_end_ns=%" PRIu64
             " runtime_hash_duration_ns=%" PRIu64
+            " runtime_hash_cpu_ns=%" PRIu64
             " runtime_hash_result=%d"
             " guest_hash_start_ns=%" PRIu64
             " guest_hash_end_ns=%" PRIu64
             " guest_hash_duration_ns=%" PRIu64
+            " guest_hash_cpu_ns=%" PRIu64
             " guest_hash_result=%d"
             " guest_release_ns=%" PRIu64
             " runtime_release_ns=%" PRIu64
@@ -812,11 +819,16 @@ void llmopt_report(void)
             runtime.runtime_hash_start_ns, runtime.runtime_hash_end_ns,
             measured_duration_ns(runtime.runtime_hash_start_ns,
                                  runtime.runtime_hash_end_ns),
+            measured_duration_ns(
+                runtime.runtime_identity_job.hash_cpu_start_ns,
+                runtime.runtime_identity_job.hash_cpu_end_ns),
             runtime.runtime_hash_result,
             runtime.identity_job.hash_start_ns,
             runtime.identity_job.hash_end_ns,
             measured_duration_ns(runtime.identity_job.hash_start_ns,
                                  runtime.identity_job.hash_end_ns),
+            measured_duration_ns(runtime.identity_job.hash_cpu_start_ns,
+                                 runtime.identity_job.hash_cpu_end_ns),
             runtime.identity_job.hash_result, runtime.guest_release_ns,
             runtime.runtime_release_ns,
             runtime.identity_ready_ns, runtime.first_dispatch_ns,
@@ -1001,11 +1013,13 @@ void llmopt_initialize(bool debugger_active, const char *guest_binary,
         runtime.runtime_identity_checks++;
         if (runtime.synchronous_runtime_identity) {
             runtime.runtime_hash_start_ns = now_ns();
+            runtime.runtime_identity_job.hash_cpu_start_ns = thread_cpu_ns();
             runtime.runtime_hash_result = file_identity(
                 &runtime.runtime_identity_job,
                 runtime.runtime_identity_job.runtime_binary,
                 runtime.runtime_identity_job.expected_runtime_sha256);
             runtime.runtime_hash_end_ns = now_ns();
+            runtime.runtime_identity_job.hash_cpu_end_ns = thread_cpu_ns();
             runtime.runtime_identity_job.hash_start_ns =
                 runtime.runtime_hash_start_ns;
             runtime.runtime_identity_job.hash_end_ns =
@@ -1066,6 +1080,13 @@ static uint64_t now_ns(void)
 {
     struct timespec value;
     clock_gettime(CLOCK_MONOTONIC, &value);
+    return (uint64_t)value.tv_sec * UINT64_C(1000000000) + value.tv_nsec;
+}
+
+static uint64_t thread_cpu_ns(void)
+{
+    struct timespec value;
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &value);
     return (uint64_t)value.tv_sec * UINT64_C(1000000000) + value.tv_nsec;
 }
 
